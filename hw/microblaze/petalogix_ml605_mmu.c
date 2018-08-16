@@ -25,6 +25,10 @@
  * THE SOFTWARE.
  */
 
+#include "qemu/osdep.h"
+#include "qapi/error.h"
+#include "qemu-common.h"
+#include "cpu.h"
 #include "hw/sysbus.h"
 #include "hw/hw.h"
 #include "net/net.h"
@@ -32,10 +36,10 @@
 #include "sysemu/sysemu.h"
 #include "hw/devices.h"
 #include "hw/boards.h"
-#include "sysemu/blockdev.h"
+#include "sysemu/block-backend.h"
 #include "hw/char/serial.h"
 #include "exec/address-spaces.h"
-#include "hw/ssi.h"
+#include "hw/ssi/ssi.h"
 
 #include "boot.h"
 
@@ -64,20 +68,6 @@
 #define SPI_IRQ             4
 #define UART16550_IRQ       5
 
-static void machine_cpu_reset(MicroBlazeCPU *cpu)
-{
-    CPUMBState *env = &cpu->env;
-
-    env->pvr.regs[10] = 0x0e000000; /* virtex 6 */
-    /* setup pvr to match kernel setting */
-    env->pvr.regs[5] |= PVR5_DCACHE_WRITEBACK_MASK;
-    env->pvr.regs[0] |= PVR0_USE_FPU_MASK | PVR0_ENDI;
-    env->pvr.regs[0] = (env->pvr.regs[0] & ~PVR0_VERSION_MASK) | (0x14 << 8);
-    env->pvr.regs[2] ^= PVR2_USE_FPU2_MASK;
-    env->pvr.regs[4] = 0xc56b8000;
-    env->pvr.regs[5] = 0xc56be000;
-}
-
 static void
 petalogix_ml605_init(MachineState *machine)
 {
@@ -89,32 +79,40 @@ petalogix_ml605_init(MachineState *machine)
     SysBusDevice *busdev;
     DriveInfo *dinfo;
     int i;
-    hwaddr ddr_base = MEMORY_BASEADDR;
     MemoryRegion *phys_lmb_bram = g_new(MemoryRegion, 1);
     MemoryRegion *phys_ram = g_new(MemoryRegion, 1);
     qemu_irq irq[32];
 
     /* init CPUs */
     cpu = MICROBLAZE_CPU(object_new(TYPE_MICROBLAZE_CPU));
+    object_property_set_str(OBJECT(cpu), "8.10.a", "version", &error_abort);
+    /* Use FPU but don't use floating point conversion and square
+     * root instructions
+     */
+    object_property_set_int(OBJECT(cpu), 1, "use-fpu", &error_abort);
+    object_property_set_bool(OBJECT(cpu), true, "dcache-writeback",
+                             &error_abort);
+    object_property_set_bool(OBJECT(cpu), true, "endianness", &error_abort);
     object_property_set_bool(OBJECT(cpu), true, "realized", &error_abort);
 
     /* Attach emulated BRAM through the LMB.  */
     memory_region_init_ram(phys_lmb_bram, NULL, "petalogix_ml605.lmb_bram",
-                           LMB_BRAM_SIZE);
+                           LMB_BRAM_SIZE, &error_fatal);
     vmstate_register_ram_global(phys_lmb_bram);
     memory_region_add_subregion(address_space_mem, 0x00000000, phys_lmb_bram);
 
-    memory_region_init_ram(phys_ram, NULL, "petalogix_ml605.ram", ram_size);
+    memory_region_init_ram(phys_ram, NULL, "petalogix_ml605.ram", ram_size,
+                           &error_fatal);
     vmstate_register_ram_global(phys_ram);
-    memory_region_add_subregion(address_space_mem, ddr_base, phys_ram);
+    memory_region_add_subregion(address_space_mem, MEMORY_BASEADDR, phys_ram);
 
     dinfo = drive_get(IF_PFLASH, 0, 0);
     /* 5th parameter 2 means bank-width
      * 10th paremeter 0 means little-endian */
     pflash_cfi01_register(FLASH_BASEADDR,
                           NULL, "petalogix_ml605.flash", FLASH_SIZE,
-                          dinfo ? dinfo->bdrv : NULL, (64 * 1024),
-                          FLASH_SIZE >> 16,
+                          dinfo ? blk_by_legacy_dinfo(dinfo) : NULL,
+                          (64 * 1024), FLASH_SIZE >> 16,
                           2, 0x89, 0x18, 0x0000, 0x0, 0);
 
 
@@ -193,31 +191,38 @@ petalogix_ml605_init(MachineState *machine)
         spi = (SSIBus *)qdev_get_child_bus(dev, "spi");
 
         for (i = 0; i < NUM_SPI_FLASHES; i++) {
+            DriveInfo *dinfo = drive_get_next(IF_MTD);
             qemu_irq cs_line;
 
-            dev = ssi_create_slave(spi, "n25q128");
+            dev = ssi_create_slave_no_init(spi, "n25q128");
+            if (dinfo) {
+                qdev_prop_set_drive(dev, "drive", blk_by_legacy_dinfo(dinfo),
+                                    &error_fatal);
+            }
+            qdev_init_nofail(dev);
+
             cs_line = qdev_get_gpio_in_named(dev, SSI_GPIO_CS, 0);
             sysbus_connect_irq(busdev, i+1, cs_line);
         }
     }
 
-    microblaze_load_kernel(cpu, ddr_base, ram_size,
+    /* setup PVR to match kernel settings */
+    cpu->env.pvr.regs[4] = 0xc56b8000;
+    cpu->env.pvr.regs[5] = 0xc56be000;
+    cpu->env.pvr.regs[10] = 0x0e000000; /* virtex 6 */
+
+    microblaze_load_kernel(cpu, MEMORY_BASEADDR, ram_size,
                            machine->initrd_filename,
                            BINARY_DEVICE_TREE_FILE,
-                           machine_cpu_reset);
+                           NULL);
 
 }
 
-static QEMUMachine petalogix_ml605_machine = {
-    .name = "petalogix-ml605",
-    .desc = "PetaLogix linux refdesign for xilinx ml605 little endian",
-    .init = petalogix_ml605_init,
-    .is_default = 0,
-};
-
-static void petalogix_ml605_machine_init(void)
+static void petalogix_ml605_machine_init(MachineClass *mc)
 {
-    qemu_register_machine(&petalogix_ml605_machine);
+    mc->desc = "PetaLogix linux refdesign for xilinx ml605 little endian";
+    mc->init = petalogix_ml605_init;
+    mc->is_default = 0;
 }
 
-machine_init(petalogix_ml605_machine_init);
+DEFINE_MACHINE("petalogix-ml605", petalogix_ml605_machine_init)

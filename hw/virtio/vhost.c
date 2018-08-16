@@ -13,24 +13,63 @@
  * GNU GPL, version 2 or (at your option) any later version.
  */
 
+#include "qemu/osdep.h"
+#include "qapi/error.h"
 #include "hw/virtio/vhost.h"
 #include "hw/hw.h"
 #include "qemu/atomic.h"
 #include "qemu/range.h"
+#include "qemu/error-report.h"
+#include "qemu/memfd.h"
 #include <linux/vhost.h>
 #include "exec/address-spaces.h"
 #include "hw/virtio/virtio-bus.h"
+#include "hw/virtio/virtio-access.h"
 #include "migration/migration.h"
+#include "sysemu/dma.h"
+
+/* enabled until disconnected backend stabilizes */
+#define _VHOST_DEBUG 1
+
+#ifdef _VHOST_DEBUG
+#define VHOST_OPS_DEBUG(fmt, ...) \
+    do { error_report(fmt ": %s (%d)", ## __VA_ARGS__, \
+                      strerror(errno), errno); } while (0)
+#else
+#define VHOST_OPS_DEBUG(fmt, ...) \
+    do { } while (0)
+#endif
+
+static struct vhost_log *vhost_log;
+static struct vhost_log *vhost_log_shm;
+
+static unsigned int used_memslots;
+static QLIST_HEAD(, vhost_dev) vhost_devices =
+    QLIST_HEAD_INITIALIZER(vhost_devices);
+
+bool vhost_has_free_slot(void)
+{
+    unsigned int slots_limit = ~0U;
+    struct vhost_dev *hdev;
+
+    QLIST_FOREACH(hdev, &vhost_devices, entry) {
+        unsigned int r = hdev->vhost_ops->vhost_backend_memslots_limit(hdev);
+        slots_limit = MIN(slots_limit, r);
+    }
+    return slots_limit > used_memslots;
+}
 
 static void vhost_dev_sync_region(struct vhost_dev *dev,
                                   MemoryRegionSection *section,
                                   uint64_t mfirst, uint64_t mlast,
                                   uint64_t rfirst, uint64_t rlast)
 {
+    vhost_log_chunk_t *log = dev->log->log;
+
     uint64_t start = MAX(mfirst, rfirst);
     uint64_t end = MIN(mlast, rlast);
-    vhost_log_chunk_t *from = dev->log + start / VHOST_LOG_CHUNK;
-    vhost_log_chunk_t *to = dev->log + end / VHOST_LOG_CHUNK + 1;
+    vhost_log_chunk_t *from = log + start / VHOST_LOG_CHUNK;
+    vhost_log_chunk_t *to = log + end / VHOST_LOG_CHUNK + 1;
     uint64_t addr = (start / VHOST_LOG_CHUNK) * VHOST_LOG_CHUNK;
 
     if (end < start) {
@@ -235,6 +274,13 @@ static void vhost_dev_assign_memory(struct vhost_dev *dev,
             continue;
         }
 
+        if (dev->vhost_ops->vhost_backend_can_merge &&
+            !dev->vhost_ops->vhost_backend_can_merge(dev, uaddr, size,
+                                                     reg->userspace_addr,
+                                                     reg->memory_size)) {
+            continue;
+        }
+
         if (merged) {
             --to;
             assert(to >= 0);
@@ -281,51 +327,194 @@ static uint64_t vhost_get_log_size(struct vhost_dev *dev)
     return log_size;
 }
 
-static inline void vhost_dev_log_resize(struct vhost_dev* dev, uint64_t size)
+static struct vhost_log *vhost_log_alloc(uint64_t size, bool share)
 {
-    vhost_log_chunk_t *log;
-    uint64_t log_base;
+    struct vhost_log *log;
+    uint64_t logsize = size * sizeof(*(log->log));
+    int fd = -1;
+
+    log = g_new0(struct vhost_log, 1);
+    if (share) {
+        log->log = qemu_memfd_alloc("vhost-log", logsize,
+                                    F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL,
+                                    &fd);
+        memset(log->log, 0, logsize);
+    } else {
+        log->log = g_malloc0(logsize);
+    }
+
+    log->size = size;
+    log->refcnt = 1;
+    log->fd = fd;
+
+    return log;
+}
+
+static struct vhost_log *vhost_log_get(uint64_t size, bool share)
+{
+    struct vhost_log *log = share ? vhost_log_shm : vhost_log;
+
+    if (!log || log->size != size) {
+        log = vhost_log_alloc(size, share);
+        if (share) {
+            vhost_log_shm = log;
+        } else {
+            vhost_log = log;
+        }
+    } else {
+        ++log->refcnt;
+    }
+
+    return log;
+}
+
+static void vhost_log_put(struct vhost_dev *dev, bool sync)
+{
+    struct vhost_log *log = dev->log;
+
+    if (!log) {
+        return;
+    }
+    dev->log = NULL;
+    dev->log_size = 0;
+
+    --log->refcnt;
+    if (log->refcnt == 0) {
+        /* Sync only the range covered by the old log */
+        if (dev->log_size && sync) {
+            vhost_log_sync_range(dev, 0, dev->log_size * VHOST_LOG_CHUNK - 1);
+        }
+
+        if (vhost_log == log) {
+            g_free(log->log);
+            vhost_log = NULL;
+        } else if (vhost_log_shm == log) {
+            qemu_memfd_free(log->log, log->size * sizeof(*(log->log)),
+                            log->fd);
+            vhost_log_shm = NULL;
+        }
+
+        g_free(log);
+    }
+}
+
+static bool vhost_dev_log_is_shared(struct vhost_dev *dev)
+{
+    return dev->vhost_ops->vhost_requires_shm_log &&
+           dev->vhost_ops->vhost_requires_shm_log(dev);
+}
+
+static inline void vhost_dev_log_resize(struct vhost_dev *dev, uint64_t size)
+{
+    struct vhost_log *log = vhost_log_get(size, vhost_dev_log_is_shared(dev));
+    uint64_t log_base = (uintptr_t)log->log;
     int r;
 
-    log = g_malloc0(size * sizeof *log);
-    log_base = (uint64_t)(unsigned long)log;
-    r = dev->vhost_ops->vhost_call(dev, VHOST_SET_LOG_BASE, &log_base);
-    assert(r >= 0);
-    /* Sync only the range covered by the old log */
-    if (dev->log_size) {
-        vhost_log_sync_range(dev, 0, dev->log_size * VHOST_LOG_CHUNK - 1);
+    /* inform backend of log switching, this must be done before
+       releasing the current log, to ensure no logging is lost */
+    r = dev->vhost_ops->vhost_set_log_base(dev, log_base, log);
+    if (r < 0) {
+        VHOST_OPS_DEBUG("vhost_set_log_base failed");
     }
-    g_free(dev->log);
+
+    vhost_log_put(dev, true);
     dev->log = log;
     dev->log_size = size;
+}
+
+static int vhost_dev_has_iommu(struct vhost_dev *dev)
+{
+    VirtIODevice *vdev = dev->vdev;
+
+    return virtio_host_has_feature(vdev, VIRTIO_F_IOMMU_PLATFORM);
+}
+
+static void *vhost_memory_map(struct vhost_dev *dev, hwaddr addr,
+                              hwaddr *plen, int is_write)
+{
+    if (!vhost_dev_has_iommu(dev)) {
+        return cpu_physical_memory_map(addr, plen, is_write);
+    } else {
+        return (void *)(uintptr_t)addr;
+    }
+}
+
+static void vhost_memory_unmap(struct vhost_dev *dev, void *buffer,
+                               hwaddr len, int is_write,
+                               hwaddr access_len)
+{
+    if (!vhost_dev_has_iommu(dev)) {
+        cpu_physical_memory_unmap(buffer, len, is_write, access_len);
+    }
+}
+
+static int vhost_verify_ring_part_mapping(struct vhost_dev *dev,
+                                          void *part,
+                                          uint64_t part_addr,
+                                          uint64_t part_size,
+                                          uint64_t start_addr,
+                                          uint64_t size)
+{
+    hwaddr l;
+    void *p;
+    int r = 0;
+
+    if (!ranges_overlap(start_addr, size, part_addr, part_size)) {
+        return 0;
+    }
+    l = part_size;
+    p = vhost_memory_map(dev, part_addr, &l, 1);
+    if (!p || l != part_size) {
+        r = -ENOMEM;
+    }
+    if (p != part) {
+        r = -EBUSY;
+    }
+    vhost_memory_unmap(dev, p, l, 0, 0);
+    return r;
 }
 
 static int vhost_verify_ring_mappings(struct vhost_dev *dev,
                                       uint64_t start_addr,
                                       uint64_t size)
 {
-    int i;
+    int i, j;
     int r = 0;
+    const char *part_name[] = {
+        "descriptor table",
+        "available ring",
+        "used ring"
+    };
 
-    for (i = 0; !r && i < dev->nvqs; ++i) {
+    for (i = 0; i < dev->nvqs; ++i) {
         struct vhost_virtqueue *vq = dev->vqs + i;
-        hwaddr l;
-        void *p;
 
-        if (!ranges_overlap(start_addr, size, vq->ring_phys, vq->ring_size)) {
-            continue;
+        j = 0;
+        r = vhost_verify_ring_part_mapping(dev, vq->desc, vq->desc_phys,
+                                           vq->desc_size, start_addr, size);
+        if (!r) {
+            break;
         }
-        l = vq->ring_size;
-        p = cpu_physical_memory_map(vq->ring_phys, &l, 1);
-        if (!p || l != vq->ring_size) {
-            fprintf(stderr, "Unable to map ring buffer for ring %d\n", i);
-            r = -ENOMEM;
+
+        j++;
+        r = vhost_verify_ring_part_mapping(dev, vq->avail, vq->avail_phys,
+                                           vq->avail_size, start_addr, size);
+        if (!r) {
+            break;
         }
-        if (p != vq->ring) {
-            fprintf(stderr, "Ring buffer relocated for ring %d\n", i);
-            r = -EBUSY;
+
+        j++;
+        r = vhost_verify_ring_part_mapping(dev, vq->used, vq->used_phys,
+                                           vq->used_size, start_addr, size);
+        if (!r) {
+            break;
         }
-        cpu_physical_memory_unmap(p, l, 0, 0);
+    }
+
+    if (r == -ENOMEM) {
+        error_report("Unable to map %s for ring %d", part_name[j], i);
+    } else if (r == -EBUSY) {
+        error_report("%s relocated for ring %d", part_name[j], i);
     }
     return r;
 }
@@ -377,7 +566,8 @@ static void vhost_set_memory(MemoryListener *listener,
                                          memory_listener);
     hwaddr start_addr = section->offset_within_address_space;
     ram_addr_t size = int128_get64(section->size);
-    bool log_dirty = memory_region_is_logging(section->mr);
+    bool log_dirty =
+        memory_region_get_dirty_log_mask(section->mr) & ~(1 << DIRTY_MEMORY_MIGRATION);
     int s = offsetof(struct vhost_memory, regions) +
         (dev->mem->nregions + 1) * sizeof dev->mem->regions[0];
     void *ram;
@@ -415,11 +605,13 @@ static void vhost_set_memory(MemoryListener *listener,
     dev->mem_changed_start_addr = MIN(dev->mem_changed_start_addr, start_addr);
     dev->mem_changed_end_addr = MAX(dev->mem_changed_end_addr, start_addr + size - 1);
     dev->memory_changed = true;
+    used_memslots = dev->mem->nregions;
 }
 
 static bool vhost_section(MemoryRegionSection *section)
 {
-    return memory_region_is_ram(section->mr);
+    return memory_region_is_ram(section->mr) &&
+        !memory_region_is_rom(section->mr);
 }
 
 static void vhost_begin(MemoryListener *listener)
@@ -458,8 +650,10 @@ static void vhost_commit(MemoryListener *listener)
     }
 
     if (!dev->log_enabled) {
-        r = dev->vhost_ops->vhost_call(dev, VHOST_SET_MEM_TABLE, dev->mem);
-        assert(r >= 0);
+        r = dev->vhost_ops->vhost_set_mem_table(dev, dev->mem);
+        if (r < 0) {
+            VHOST_OPS_DEBUG("vhost_set_mem_table failed");
+        }
         dev->memory_changed = false;
         return;
     }
@@ -471,8 +665,10 @@ static void vhost_commit(MemoryListener *listener)
     if (dev->log_size < log_size) {
         vhost_dev_log_resize(dev, log_size + VHOST_LOG_BUFFER);
     }
-    r = dev->vhost_ops->vhost_call(dev, VHOST_SET_MEM_TABLE, dev->mem);
-    assert(r >= 0);
+    r = dev->vhost_ops->vhost_set_mem_table(dev, dev->mem);
+    if (r < 0) {
+        VHOST_OPS_DEBUG("vhost_set_mem_table failed");
+    }
     /* To log less, can only decrease log size after table update. */
     if (dev->log_size > log_size + VHOST_LOG_BUFFER) {
         vhost_dev_log_resize(dev, log_size);
@@ -522,6 +718,63 @@ static void vhost_region_del(MemoryListener *listener,
     }
 }
 
+static void vhost_iommu_unmap_notify(IOMMUNotifier *n, IOMMUTLBEntry *iotlb)
+{
+    struct vhost_iommu *iommu = container_of(n, struct vhost_iommu, n);
+    struct vhost_dev *hdev = iommu->hdev;
+    hwaddr iova = iotlb->iova + iommu->iommu_offset;
+
+    if (hdev->vhost_ops->vhost_invalidate_device_iotlb(hdev, iova,
+                                                       iotlb->addr_mask + 1)) {
+        error_report("Fail to invalidate device iotlb");
+    }
+}
+
+static void vhost_iommu_region_add(MemoryListener *listener,
+                                   MemoryRegionSection *section)
+{
+    struct vhost_dev *dev = container_of(listener, struct vhost_dev,
+                                         iommu_listener);
+    struct vhost_iommu *iommu;
+
+    if (!memory_region_is_iommu(section->mr)) {
+        return;
+    }
+
+    iommu = g_malloc0(sizeof(*iommu));
+    iommu->n.notify = vhost_iommu_unmap_notify;
+    iommu->n.notifier_flags = IOMMU_NOTIFIER_UNMAP;
+    iommu->mr = section->mr;
+    iommu->iommu_offset = section->offset_within_address_space -
+                          section->offset_within_region;
+    iommu->hdev = dev;
+    memory_region_register_iommu_notifier(section->mr, &iommu->n);
+    QLIST_INSERT_HEAD(&dev->iommu_list, iommu, iommu_next);
+    /* TODO: can replay help performance here? */
+}
+
+static void vhost_iommu_region_del(MemoryListener *listener,
+                                   MemoryRegionSection *section)
+{
+    struct vhost_dev *dev = container_of(listener, struct vhost_dev,
+                                         iommu_listener);
+    struct vhost_iommu *iommu;
+
+    if (!memory_region_is_iommu(section->mr)) {
+        return;
+    }
+
+    QLIST_FOREACH(iommu, &dev->iommu_list, iommu_next) {
+        if (iommu->mr == section->mr) {
+            memory_region_unregister_iommu_notifier(iommu->mr,
+                                                    &iommu->n);
+            QLIST_REMOVE(iommu, iommu_next);
+            g_free(iommu);
+            break;
+        }
+    }
+}
+
 static void vhost_region_nop(MemoryListener *listener,
                              MemoryRegionSection *section)
 {
@@ -539,33 +792,39 @@ static int vhost_virtqueue_set_addr(struct vhost_dev *dev,
         .log_guest_addr = vq->used_phys,
         .flags = enable_log ? (1 << VHOST_VRING_F_LOG) : 0,
     };
-    int r = dev->vhost_ops->vhost_call(dev, VHOST_SET_VRING_ADDR, &addr);
+    int r = dev->vhost_ops->vhost_set_vring_addr(dev, &addr);
     if (r < 0) {
+        VHOST_OPS_DEBUG("vhost_set_vring_addr failed");
         return -errno;
     }
     return 0;
 }
 
-static int vhost_dev_set_features(struct vhost_dev *dev, bool enable_log)
+static int vhost_dev_set_features(struct vhost_dev *dev,
+                                  bool enable_log)
 {
     uint64_t features = dev->acked_features;
     int r;
     if (enable_log) {
-        features |= 0x1 << VHOST_F_LOG_ALL;
+        features |= 0x1ULL << VHOST_F_LOG_ALL;
     }
-    r = dev->vhost_ops->vhost_call(dev, VHOST_SET_FEATURES, &features);
+    r = dev->vhost_ops->vhost_set_features(dev, features);
+    if (r < 0) {
+        VHOST_OPS_DEBUG("vhost_set_features failed");
+    }
     return r < 0 ? -errno : 0;
 }
 
 static int vhost_dev_set_log(struct vhost_dev *dev, bool enable_log)
 {
-    int r, t, i;
+    int r, i, idx;
     r = vhost_dev_set_features(dev, enable_log);
     if (r < 0) {
         goto err_features;
     }
     for (i = 0; i < dev->nvqs; ++i) {
-        r = vhost_virtqueue_set_addr(dev, dev->vqs + i, i,
+        idx = dev->vhost_ops->vhost_get_vq_index(dev, dev->vq_index + i);
+        r = vhost_virtqueue_set_addr(dev, dev->vqs + i, idx,
                                      enable_log);
         if (r < 0) {
             goto err_vq;
@@ -574,12 +833,11 @@ static int vhost_dev_set_log(struct vhost_dev *dev, bool enable_log)
     return 0;
 err_vq:
     for (; i >= 0; --i) {
-        t = vhost_virtqueue_set_addr(dev, dev->vqs + i, i,
-                                     dev->log_enabled);
-        assert(t >= 0);
+        idx = dev->vhost_ops->vhost_get_vq_index(dev, dev->vq_index + i);
+        vhost_virtqueue_set_addr(dev, dev->vqs + i, idx,
+                                 dev->log_enabled);
     }
-    t = vhost_dev_set_features(dev, dev->log_enabled);
-    assert(t >= 0);
+    vhost_dev_set_features(dev, dev->log_enabled);
 err_features:
     return r;
 }
@@ -601,9 +859,7 @@ static int vhost_migration_log(MemoryListener *listener, int enable)
         if (r < 0) {
             return r;
         }
-        g_free(dev->log);
-        dev->log = NULL;
-        dev->log_size = 0;
+        vhost_log_put(dev, false);
     } else {
         vhost_dev_log_resize(dev, vhost_get_log_size(dev));
         r = vhost_dev_set_log(dev, true);
@@ -636,15 +892,106 @@ static void vhost_log_global_stop(MemoryListener *listener)
 }
 
 static void vhost_log_start(MemoryListener *listener,
-                            MemoryRegionSection *section)
+                            MemoryRegionSection *section,
+                            int old, int new)
 {
     /* FIXME: implement */
 }
 
 static void vhost_log_stop(MemoryListener *listener,
-                           MemoryRegionSection *section)
+                           MemoryRegionSection *section,
+                           int old, int new)
 {
     /* FIXME: implement */
+}
+
+/* The vhost driver natively knows how to handle the vrings of non
+ * cross-endian legacy devices and modern devices. Only legacy devices
+ * exposed to a bi-endian guest may require the vhost driver to use a
+ * specific endianness.
+ */
+static inline bool vhost_needs_vring_endian(VirtIODevice *vdev)
+{
+    if (virtio_vdev_has_feature(vdev, VIRTIO_F_VERSION_1)) {
+        return false;
+    }
+#ifdef HOST_WORDS_BIGENDIAN
+    return vdev->device_endian == VIRTIO_DEVICE_ENDIAN_LITTLE;
+#else
+    return vdev->device_endian == VIRTIO_DEVICE_ENDIAN_BIG;
+#endif
+}
+
+static int vhost_virtqueue_set_vring_endian_legacy(struct vhost_dev *dev,
+                                                   bool is_big_endian,
+                                                   int vhost_vq_index)
+{
+    struct vhost_vring_state s = {
+        .index = vhost_vq_index,
+        .num = is_big_endian
+    };
+
+    if (!dev->vhost_ops->vhost_set_vring_endian(dev, &s)) {
+        return 0;
+    }
+
+    VHOST_OPS_DEBUG("vhost_set_vring_endian failed");
+    if (errno == ENOTTY) {
+        error_report("vhost does not support cross-endian");
+        return -ENOSYS;
+    }
+
+    return -errno;
+}
+
+static int vhost_memory_region_lookup(struct vhost_dev *hdev,
+                                      uint64_t gpa, uint64_t *uaddr,
+                                      uint64_t *len)
+{
+    int i;
+
+    for (i = 0; i < hdev->mem->nregions; i++) {
+        struct vhost_memory_region *reg = hdev->mem->regions + i;
+
+        if (gpa >= reg->guest_phys_addr &&
+            reg->guest_phys_addr + reg->memory_size > gpa) {
+            *uaddr = reg->userspace_addr + gpa - reg->guest_phys_addr;
+            *len = reg->guest_phys_addr + reg->memory_size - gpa;
+            return 0;
+        }
+    }
+
+    return -EFAULT;
+}
+
+void vhost_device_iotlb_miss(struct vhost_dev *dev, uint64_t iova, int write)
+{
+    IOMMUTLBEntry iotlb;
+    uint64_t uaddr, len;
+
+    rcu_read_lock();
+
+    iotlb = address_space_get_iotlb_entry(dev->vdev->dma_as,
+                                          iova, write);
+    if (iotlb.target_as != NULL) {
+        if (vhost_memory_region_lookup(dev, iotlb.translated_addr,
+                                       &uaddr, &len)) {
+            error_report("Fail to lookup the translated address "
+                         "%"PRIx64, iotlb.translated_addr);
+            goto out;
+        }
+
+        len = MIN(iotlb.addr_mask + 1, len);
+        iova = iova & ~iotlb.addr_mask;
+
+        if (dev->vhost_ops->vhost_update_device_iotlb(dev, iova, uaddr,
+                                                      len, iotlb.perm)) {
+            error_report("Fail to update device iotlb");
+            goto out;
+        }
+    }
+out:
+    rcu_read_unlock();
 }
 
 static int vhost_virtqueue_start(struct vhost_dev *dev,
@@ -652,9 +999,12 @@ static int vhost_virtqueue_start(struct vhost_dev *dev,
                                 struct vhost_virtqueue *vq,
                                 unsigned idx)
 {
+    BusState *qbus = BUS(qdev_get_parent_bus(DEVICE(vdev)));
+    VirtioBusState *vbus = VIRTIO_BUS(qbus);
+    VirtioBusClass *k = VIRTIO_BUS_GET_CLASS(vbus);
     hwaddr s, l, a;
     int r;
-    int vhost_vq_index = idx - dev->vq_index;
+    int vhost_vq_index = dev->vhost_ops->vhost_get_vq_index(dev, idx);
     struct vhost_vring_file file = {
         .index = vhost_vq_index
     };
@@ -663,48 +1013,50 @@ static int vhost_virtqueue_start(struct vhost_dev *dev,
     };
     struct VirtQueue *vvq = virtio_get_queue(vdev, idx);
 
-    assert(idx >= dev->vq_index && idx < dev->vq_index + dev->nvqs);
 
     vq->num = state.num = virtio_queue_get_num(vdev, idx);
-    r = dev->vhost_ops->vhost_call(dev, VHOST_SET_VRING_NUM, &state);
+    r = dev->vhost_ops->vhost_set_vring_num(dev, &state);
     if (r) {
+        VHOST_OPS_DEBUG("vhost_set_vring_num failed");
         return -errno;
     }
 
     state.num = virtio_queue_get_last_avail_idx(vdev, idx);
-    r = dev->vhost_ops->vhost_call(dev, VHOST_SET_VRING_BASE, &state);
+    r = dev->vhost_ops->vhost_set_vring_base(dev, &state);
     if (r) {
+        VHOST_OPS_DEBUG("vhost_set_vring_base failed");
         return -errno;
     }
 
-    s = l = virtio_queue_get_desc_size(vdev, idx);
-    a = virtio_queue_get_desc_addr(vdev, idx);
-    vq->desc = cpu_physical_memory_map(a, &l, 0);
+    if (vhost_needs_vring_endian(vdev)) {
+        r = vhost_virtqueue_set_vring_endian_legacy(dev,
+                                                    virtio_is_big_endian(vdev),
+                                                    vhost_vq_index);
+        if (r) {
+            return -errno;
+        }
+    }
+
+    vq->desc_size = s = l = virtio_queue_get_desc_size(vdev, idx);
+    vq->desc_phys = a = virtio_queue_get_desc_addr(vdev, idx);
+    vq->desc = vhost_memory_map(dev, a, &l, 0);
     if (!vq->desc || l != s) {
         r = -ENOMEM;
         goto fail_alloc_desc;
     }
-    s = l = virtio_queue_get_avail_size(vdev, idx);
-    a = virtio_queue_get_avail_addr(vdev, idx);
-    vq->avail = cpu_physical_memory_map(a, &l, 0);
+    vq->avail_size = s = l = virtio_queue_get_avail_size(vdev, idx);
+    vq->avail_phys = a = virtio_queue_get_avail_addr(vdev, idx);
+    vq->avail = vhost_memory_map(dev, a, &l, 0);
     if (!vq->avail || l != s) {
         r = -ENOMEM;
         goto fail_alloc_avail;
     }
     vq->used_size = s = l = virtio_queue_get_used_size(vdev, idx);
     vq->used_phys = a = virtio_queue_get_used_addr(vdev, idx);
-    vq->used = cpu_physical_memory_map(a, &l, 1);
+    vq->used = vhost_memory_map(dev, a, &l, 1);
     if (!vq->used || l != s) {
         r = -ENOMEM;
         goto fail_alloc_used;
-    }
-
-    vq->ring_size = s = l = virtio_queue_get_ring_size(vdev, idx);
-    vq->ring_phys = a = virtio_queue_get_ring_addr(vdev, idx);
-    vq->ring = cpu_physical_memory_map(a, &l, 1);
-    if (!vq->ring || l != s) {
-        r = -ENOMEM;
-        goto fail_alloc_ring;
     }
 
     r = vhost_virtqueue_set_addr(dev, vq, vhost_vq_index, dev->log_enabled);
@@ -714,8 +1066,9 @@ static int vhost_virtqueue_start(struct vhost_dev *dev,
     }
 
     file.fd = event_notifier_get_fd(virtio_queue_get_host_notifier(vvq));
-    r = dev->vhost_ops->vhost_call(dev, VHOST_SET_VRING_KICK, &file);
+    r = dev->vhost_ops->vhost_set_vring_kick(dev, &file);
     if (r) {
+        VHOST_OPS_DEBUG("vhost_set_vring_kick failed");
         r = -errno;
         goto fail_kick;
     }
@@ -723,21 +1076,37 @@ static int vhost_virtqueue_start(struct vhost_dev *dev,
     /* Clear and discard previous events if any. */
     event_notifier_test_and_clear(&vq->masked_notifier);
 
+    /* Init vring in unmasked state, unless guest_notifier_mask
+     * will do it later.
+     */
+    if (!vdev->use_guest_notifier_mask) {
+        /* TODO: check and handle errors. */
+        vhost_virtqueue_mask(dev, vdev, idx, false);
+    }
+
+    if (k->query_guest_notifiers &&
+        k->query_guest_notifiers(qbus->parent) &&
+        virtio_queue_vector(vdev, idx) == VIRTIO_NO_VECTOR) {
+        file.fd = -1;
+        r = dev->vhost_ops->vhost_set_vring_call(dev, &file);
+        if (r) {
+            goto fail_vector;
+        }
+    }
+
     return 0;
 
+fail_vector:
 fail_kick:
 fail_alloc:
-    cpu_physical_memory_unmap(vq->ring, virtio_queue_get_ring_size(vdev, idx),
-                              0, 0);
-fail_alloc_ring:
-    cpu_physical_memory_unmap(vq->used, virtio_queue_get_used_size(vdev, idx),
-                              0, 0);
+    vhost_memory_unmap(dev, vq->used, virtio_queue_get_used_size(vdev, idx),
+                       0, 0);
 fail_alloc_used:
-    cpu_physical_memory_unmap(vq->avail, virtio_queue_get_avail_size(vdev, idx),
-                              0, 0);
+    vhost_memory_unmap(dev, vq->avail, virtio_queue_get_avail_size(vdev, idx),
+                       0, 0);
 fail_alloc_avail:
-    cpu_physical_memory_unmap(vq->desc, virtio_queue_get_desc_size(vdev, idx),
-                              0, 0);
+    vhost_memory_unmap(dev, vq->desc, virtio_queue_get_desc_size(vdev, idx),
+                       0, 0);
 fail_alloc_desc:
     return r;
 }
@@ -747,27 +1116,36 @@ static void vhost_virtqueue_stop(struct vhost_dev *dev,
                                     struct vhost_virtqueue *vq,
                                     unsigned idx)
 {
+    int vhost_vq_index = dev->vhost_ops->vhost_get_vq_index(dev, idx);
     struct vhost_vring_state state = {
-        .index = idx - dev->vq_index
+        .index = vhost_vq_index,
     };
     int r;
-    assert(idx >= dev->vq_index && idx < dev->vq_index + dev->nvqs);
-    r = dev->vhost_ops->vhost_call(dev, VHOST_GET_VRING_BASE, &state);
+
+    r = dev->vhost_ops->vhost_get_vring_base(dev, &state);
     if (r < 0) {
-        fprintf(stderr, "vhost VQ %d ring restore failed: %d\n", idx, r);
-        fflush(stderr);
+        VHOST_OPS_DEBUG("vhost VQ %d ring restore failed: %d", idx, r);
+    } else {
+        virtio_queue_set_last_avail_idx(vdev, idx, state.num);
     }
-    virtio_queue_set_last_avail_idx(vdev, idx, state.num);
     virtio_queue_invalidate_signalled_used(vdev, idx);
-    assert (r >= 0);
-    cpu_physical_memory_unmap(vq->ring, virtio_queue_get_ring_size(vdev, idx),
-                              0, virtio_queue_get_ring_size(vdev, idx));
-    cpu_physical_memory_unmap(vq->used, virtio_queue_get_used_size(vdev, idx),
-                              1, virtio_queue_get_used_size(vdev, idx));
-    cpu_physical_memory_unmap(vq->avail, virtio_queue_get_avail_size(vdev, idx),
-                              0, virtio_queue_get_avail_size(vdev, idx));
-    cpu_physical_memory_unmap(vq->desc, virtio_queue_get_desc_size(vdev, idx),
-                              0, virtio_queue_get_desc_size(vdev, idx));
+    virtio_queue_update_used_idx(vdev, idx);
+
+    /* In the cross-endian case, we need to reset the vring endianness to
+     * native as legacy devices expect so by default.
+     */
+    if (vhost_needs_vring_endian(vdev)) {
+        vhost_virtqueue_set_vring_endian_legacy(dev,
+                                                !virtio_is_big_endian(vdev),
+                                                vhost_vq_index);
+    }
+
+    vhost_memory_unmap(dev, vq->used, virtio_queue_get_used_size(vdev, idx),
+                       1, virtio_queue_get_used_size(vdev, idx));
+    vhost_memory_unmap(dev, vq->avail, virtio_queue_get_avail_size(vdev, idx),
+                       0, virtio_queue_get_avail_size(vdev, idx));
+    vhost_memory_unmap(dev, vq->desc, virtio_queue_get_desc_size(vdev, idx),
+                       0, virtio_queue_get_desc_size(vdev, idx));
 }
 
 static void vhost_eventfd_add(MemoryListener *listener,
@@ -782,11 +1160,35 @@ static void vhost_eventfd_del(MemoryListener *listener,
 {
 }
 
+static int vhost_virtqueue_set_busyloop_timeout(struct vhost_dev *dev,
+                                                int n, uint32_t timeout)
+{
+    int vhost_vq_index = dev->vhost_ops->vhost_get_vq_index(dev, n);
+    struct vhost_vring_state state = {
+        .index = vhost_vq_index,
+        .num = timeout,
+    };
+    int r;
+
+    if (!dev->vhost_ops->vhost_set_vring_busyloop_timeout) {
+        return -EINVAL;
+    }
+
+    r = dev->vhost_ops->vhost_set_vring_busyloop_timeout(dev, &state);
+    if (r) {
+        VHOST_OPS_DEBUG("vhost_set_vring_busyloop_timeout failed");
+        return r;
+    }
+
+    return 0;
+}
+
 static int vhost_virtqueue_init(struct vhost_dev *dev,
                                 struct vhost_virtqueue *vq, int n)
 {
+    int vhost_vq_index = dev->vhost_ops->vhost_get_vq_index(dev, n);
     struct vhost_vring_file file = {
-        .index = n,
+        .index = vhost_vq_index,
     };
     int r = event_notifier_init(&vq->masked_notifier, 0);
     if (r < 0) {
@@ -794,11 +1196,15 @@ static int vhost_virtqueue_init(struct vhost_dev *dev,
     }
 
     file.fd = event_notifier_get_fd(&vq->masked_notifier);
-    r = dev->vhost_ops->vhost_call(dev, VHOST_SET_VRING_CALL, &file);
+    r = dev->vhost_ops->vhost_set_vring_call(dev, &file);
     if (r) {
+        VHOST_OPS_DEBUG("vhost_set_vring_call failed");
         r = -errno;
         goto fail_call;
     }
+
+    vq->dev = dev;
+
     return 0;
 fail_call:
     event_notifier_cleanup(&vq->masked_notifier);
@@ -811,35 +1217,59 @@ static void vhost_virtqueue_cleanup(struct vhost_virtqueue *vq)
 }
 
 int vhost_dev_init(struct vhost_dev *hdev, void *opaque,
-                   VhostBackendType backend_type, bool force)
+                   VhostBackendType backend_type, uint32_t busyloop_timeout)
 {
     uint64_t features;
-    int i, r;
+    int i, r, n_initialized_vqs = 0;
+    Error *local_err = NULL;
 
-    if (vhost_set_backend_type(hdev, backend_type) < 0) {
-        return -1;
-    }
+    hdev->vdev = NULL;
+    hdev->migration_blocker = NULL;
 
-    if (hdev->vhost_ops->vhost_backend_init(hdev, opaque) < 0) {
-        return -errno;
-    }
+    r = vhost_set_backend_type(hdev, backend_type);
+    assert(r >= 0);
 
-    r = hdev->vhost_ops->vhost_call(hdev, VHOST_SET_OWNER, NULL);
+    r = hdev->vhost_ops->vhost_backend_init(hdev, opaque);
     if (r < 0) {
         goto fail;
     }
 
-    r = hdev->vhost_ops->vhost_call(hdev, VHOST_GET_FEATURES, &features);
-    if (r < 0) {
+    if (used_memslots > hdev->vhost_ops->vhost_backend_memslots_limit(hdev)) {
+        error_report("vhost backend memory slots limit is less"
+                " than current number of present memory slots");
+        r = -1;
         goto fail;
     }
 
-    for (i = 0; i < hdev->nvqs; ++i) {
-        r = vhost_virtqueue_init(hdev, hdev->vqs + i, i);
+    r = hdev->vhost_ops->vhost_set_owner(hdev);
+    if (r < 0) {
+        VHOST_OPS_DEBUG("vhost_set_owner failed");
+        goto fail;
+    }
+
+    r = hdev->vhost_ops->vhost_get_features(hdev, &features);
+    if (r < 0) {
+        VHOST_OPS_DEBUG("vhost_get_features failed");
+        goto fail;
+    }
+
+    for (i = 0; i < hdev->nvqs; ++i, ++n_initialized_vqs) {
+        r = vhost_virtqueue_init(hdev, hdev->vqs + i, hdev->vq_index + i);
         if (r < 0) {
-            goto fail_vq;
+            goto fail;
         }
     }
+
+    if (busyloop_timeout) {
+        for (i = 0; i < hdev->nvqs; ++i) {
+            r = vhost_virtqueue_set_busyloop_timeout(hdev, hdev->vq_index + i,
+                                                     busyloop_timeout);
+            if (r < 0) {
+                goto fail_busyloop;
+            }
+        }
+    }
+
     hdev->features = features;
 
     hdev->memory_listener = (MemoryListener) {
@@ -857,12 +1287,31 @@ int vhost_dev_init(struct vhost_dev *hdev, void *opaque,
         .eventfd_del = vhost_eventfd_del,
         .priority = 10
     };
-    hdev->migration_blocker = NULL;
-    if (!(hdev->features & (0x1 << VHOST_F_LOG_ALL))) {
-        error_setg(&hdev->migration_blocker,
-                   "Migration disabled: vhost lacks VHOST_F_LOG_ALL feature.");
-        migrate_add_blocker(hdev->migration_blocker);
+
+    hdev->iommu_listener = (MemoryListener) {
+        .region_add = vhost_iommu_region_add,
+        .region_del = vhost_iommu_region_del,
+    };
+
+    if (hdev->migration_blocker == NULL) {
+        if (!(hdev->features & (0x1ULL << VHOST_F_LOG_ALL))) {
+            error_setg(&hdev->migration_blocker,
+                       "Migration disabled: vhost lacks VHOST_F_LOG_ALL feature.");
+        } else if (vhost_dev_log_is_shared(hdev) && !qemu_memfd_check()) {
+            error_setg(&hdev->migration_blocker,
+                       "Migration disabled: failed to allocate shared memory");
+        }
     }
+
+    if (hdev->migration_blocker != NULL) {
+        r = migrate_add_blocker(hdev->migration_blocker, &local_err);
+        if (local_err) {
+            error_report_err(local_err);
+            error_free(hdev->migration_blocker);
+            goto fail_busyloop;
+        }
+    }
+
     hdev->mem = g_malloc0(offsetof(struct vhost_memory, regions));
     hdev->n_mem_sections = 0;
     hdev->mem_sections = NULL;
@@ -872,43 +1321,43 @@ int vhost_dev_init(struct vhost_dev *hdev, void *opaque,
     hdev->started = false;
     hdev->memory_changed = false;
     memory_listener_register(&hdev->memory_listener, &address_space_memory);
-    hdev->force = force;
+    QLIST_INSERT_HEAD(&vhost_devices, hdev, entry);
     return 0;
-fail_vq:
+
+fail_busyloop:
     while (--i >= 0) {
-        vhost_virtqueue_cleanup(hdev->vqs + i);
+        vhost_virtqueue_set_busyloop_timeout(hdev, hdev->vq_index + i, 0);
     }
 fail:
-    r = -errno;
-    hdev->vhost_ops->vhost_backend_cleanup(hdev);
+    hdev->nvqs = n_initialized_vqs;
+    vhost_dev_cleanup(hdev);
     return r;
 }
 
 void vhost_dev_cleanup(struct vhost_dev *hdev)
 {
     int i;
+
     for (i = 0; i < hdev->nvqs; ++i) {
         vhost_virtqueue_cleanup(hdev->vqs + i);
     }
-    memory_listener_unregister(&hdev->memory_listener);
+    if (hdev->mem) {
+        /* those are only safe after successful init */
+        memory_listener_unregister(&hdev->memory_listener);
+        QLIST_REMOVE(hdev, entry);
+    }
     if (hdev->migration_blocker) {
         migrate_del_blocker(hdev->migration_blocker);
         error_free(hdev->migration_blocker);
     }
     g_free(hdev->mem);
     g_free(hdev->mem_sections);
-    hdev->vhost_ops->vhost_backend_cleanup(hdev);
-}
+    if (hdev->vhost_ops) {
+        hdev->vhost_ops->vhost_backend_cleanup(hdev);
+    }
+    assert(!hdev->log);
 
-bool vhost_dev_query(struct vhost_dev *hdev, VirtIODevice *vdev)
-{
-    BusState *qbus = BUS(qdev_get_parent_bus(DEVICE(vdev)));
-    VirtioBusState *vbus = VIRTIO_BUS(qbus);
-    VirtioBusClass *k = VIRTIO_BUS_GET_CLASS(vbus);
-
-    return !k->query_guest_notifiers ||
-           k->query_guest_notifiers(qbus->parent) ||
-           hdev->force;
+    memset(hdev, 0, sizeof(struct vhost_dev));
 }
 
 /* Stop processing guest IO notifications in qemu.
@@ -917,19 +1366,22 @@ bool vhost_dev_query(struct vhost_dev *hdev, VirtIODevice *vdev)
 int vhost_dev_enable_notifiers(struct vhost_dev *hdev, VirtIODevice *vdev)
 {
     BusState *qbus = BUS(qdev_get_parent_bus(DEVICE(vdev)));
-    VirtioBusState *vbus = VIRTIO_BUS(qbus);
-    VirtioBusClass *k = VIRTIO_BUS_GET_CLASS(vbus);
-    int i, r;
-    if (!k->set_host_notifier) {
-        fprintf(stderr, "binding does not support host notifiers\n");
-        r = -ENOSYS;
+    int i, r, e;
+
+    /* We will pass the notifiers to the kernel, make sure that QEMU
+     * doesn't interfere.
+     */
+    r = virtio_device_grab_ioeventfd(vdev);
+    if (r < 0) {
+        error_report("binding does not support host notifiers");
         goto fail;
     }
 
     for (i = 0; i < hdev->nvqs; ++i) {
-        r = k->set_host_notifier(qbus->parent, hdev->vq_index + i, true);
+        r = virtio_bus_set_host_notifier(VIRTIO_BUS(qbus), hdev->vq_index + i,
+                                         true);
         if (r < 0) {
-            fprintf(stderr, "vhost VQ %d notifier binding failed: %d\n", i, -r);
+            error_report("vhost VQ %d notifier binding failed: %d", i, -r);
             goto fail_vq;
         }
     }
@@ -937,13 +1389,14 @@ int vhost_dev_enable_notifiers(struct vhost_dev *hdev, VirtIODevice *vdev)
     return 0;
 fail_vq:
     while (--i >= 0) {
-        r = k->set_host_notifier(qbus->parent, hdev->vq_index + i, false);
-        if (r < 0) {
-            fprintf(stderr, "vhost VQ %d notifier cleanup error: %d\n", i, -r);
-            fflush(stderr);
+        e = virtio_bus_set_host_notifier(VIRTIO_BUS(qbus), hdev->vq_index + i,
+                                         false);
+        if (e < 0) {
+            error_report("vhost VQ %d notifier cleanup error: %d", i, -r);
         }
-        assert (r >= 0);
+        assert (e >= 0);
     }
+    virtio_device_release_ioeventfd(vdev);
 fail:
     return r;
 }
@@ -956,18 +1409,17 @@ fail:
 void vhost_dev_disable_notifiers(struct vhost_dev *hdev, VirtIODevice *vdev)
 {
     BusState *qbus = BUS(qdev_get_parent_bus(DEVICE(vdev)));
-    VirtioBusState *vbus = VIRTIO_BUS(qbus);
-    VirtioBusClass *k = VIRTIO_BUS_GET_CLASS(vbus);
     int i, r;
 
     for (i = 0; i < hdev->nvqs; ++i) {
-        r = k->set_host_notifier(qbus->parent, hdev->vq_index + i, false);
+        r = virtio_bus_set_host_notifier(VIRTIO_BUS(qbus), hdev->vq_index + i,
+                                         false);
         if (r < 0) {
-            fprintf(stderr, "vhost VQ %d notifier cleanup failed: %d\n", i, -r);
-            fflush(stderr);
+            error_report("vhost VQ %d notifier cleanup failed: %d", i, -r);
         }
         assert (r >= 0);
     }
+    virtio_device_release_ioeventfd(vdev);
 }
 
 /* Test and clear event pending status.
@@ -986,27 +1438,31 @@ void vhost_virtqueue_mask(struct vhost_dev *hdev, VirtIODevice *vdev, int n,
 {
     struct VirtQueue *vvq = virtio_get_queue(vdev, n);
     int r, index = n - hdev->vq_index;
+    struct vhost_vring_file file;
 
-    assert(n >= hdev->vq_index && n < hdev->vq_index + hdev->nvqs);
+    /* should only be called after backend is connected */
+    assert(hdev->vhost_ops);
 
-    struct vhost_vring_file file = {
-        .index = index
-    };
     if (mask) {
+        assert(vdev->use_guest_notifier_mask);
         file.fd = event_notifier_get_fd(&hdev->vqs[index].masked_notifier);
     } else {
         file.fd = event_notifier_get_fd(virtio_queue_get_guest_notifier(vvq));
     }
-    r = hdev->vhost_ops->vhost_call(hdev, VHOST_SET_VRING_CALL, &file);
-    assert(r >= 0);
+
+    file.index = hdev->vhost_ops->vhost_get_vq_index(hdev, n);
+    r = hdev->vhost_ops->vhost_set_vring_call(hdev, &file);
+    if (r < 0) {
+        VHOST_OPS_DEBUG("vhost_set_vring_call failed");
+    }
 }
 
-unsigned vhost_get_features(struct vhost_dev *hdev, const int *feature_bits,
-        unsigned features)
+uint64_t vhost_get_features(struct vhost_dev *hdev, const int *feature_bits,
+                            uint64_t features)
 {
     const int *bit = feature_bits;
     while (*bit != VHOST_INVALID_FEATURE_BIT) {
-        unsigned bit_mask = (1 << *bit);
+        uint64_t bit_mask = (1ULL << *bit);
         if (!(hdev->features & bit_mask)) {
             features &= ~bit_mask;
         }
@@ -1016,11 +1472,11 @@ unsigned vhost_get_features(struct vhost_dev *hdev, const int *feature_bits,
 }
 
 void vhost_ack_features(struct vhost_dev *hdev, const int *feature_bits,
-        unsigned features)
+                        uint64_t features)
 {
     const int *bit = feature_bits;
     while (*bit != VHOST_INVALID_FEATURE_BIT) {
-        unsigned bit_mask = (1 << *bit);
+        uint64_t bit_mask = (1ULL << *bit);
         if (features & bit_mask) {
             hdev->acked_features |= bit_mask;
         }
@@ -1033,14 +1489,24 @@ int vhost_dev_start(struct vhost_dev *hdev, VirtIODevice *vdev)
 {
     int i, r;
 
+    /* should only be called after backend is connected */
+    assert(hdev->vhost_ops);
+
     hdev->started = true;
+    hdev->vdev = vdev;
 
     r = vhost_dev_set_features(hdev, hdev->log_enabled);
     if (r < 0) {
         goto fail_features;
     }
-    r = hdev->vhost_ops->vhost_call(hdev, VHOST_SET_MEM_TABLE, hdev->mem);
+
+    if (vhost_dev_has_iommu(hdev)) {
+        memory_listener_register(&hdev->iommu_listener, vdev->dma_as);
+    }
+
+    r = hdev->vhost_ops->vhost_set_mem_table(hdev, hdev->mem);
     if (r < 0) {
+        VHOST_OPS_DEBUG("vhost_set_mem_table failed");
         r = -errno;
         goto fail_mem;
     }
@@ -1055,18 +1521,35 @@ int vhost_dev_start(struct vhost_dev *hdev, VirtIODevice *vdev)
     }
 
     if (hdev->log_enabled) {
+        uint64_t log_base;
+
         hdev->log_size = vhost_get_log_size(hdev);
-        hdev->log = hdev->log_size ?
-            g_malloc0(hdev->log_size * sizeof *hdev->log) : NULL;
-        r = hdev->vhost_ops->vhost_call(hdev, VHOST_SET_LOG_BASE, hdev->log);
+        hdev->log = vhost_log_get(hdev->log_size,
+                                  vhost_dev_log_is_shared(hdev));
+        log_base = (uintptr_t)hdev->log->log;
+        r = hdev->vhost_ops->vhost_set_log_base(hdev,
+                                                hdev->log_size ? log_base : 0,
+                                                hdev->log);
         if (r < 0) {
+            VHOST_OPS_DEBUG("vhost_set_log_base failed");
             r = -errno;
             goto fail_log;
         }
     }
 
+    if (vhost_dev_has_iommu(hdev)) {
+        hdev->vhost_ops->vhost_set_iotlb_callback(hdev, true);
+
+        /* Update used ring information for IOTLB to work correctly,
+         * vhost-kernel code requires for this.*/
+        for (i = 0; i < hdev->nvqs; ++i) {
+            struct vhost_virtqueue *vq = hdev->vqs + i;
+            vhost_device_iotlb_miss(hdev, vq->used_phys, true);
+        }
+    }
     return 0;
 fail_log:
+    vhost_log_put(hdev, false);
 fail_vq:
     while (--i >= 0) {
         vhost_virtqueue_stop(hdev,
@@ -1075,6 +1558,7 @@ fail_vq:
                              hdev->vq_index + i);
     }
     i = hdev->nvqs;
+
 fail_mem:
 fail_features:
 
@@ -1087,17 +1571,31 @@ void vhost_dev_stop(struct vhost_dev *hdev, VirtIODevice *vdev)
 {
     int i;
 
+    /* should only be called after backend is connected */
+    assert(hdev->vhost_ops);
+
     for (i = 0; i < hdev->nvqs; ++i) {
         vhost_virtqueue_stop(hdev,
                              vdev,
                              hdev->vqs + i,
                              hdev->vq_index + i);
     }
-    vhost_log_sync_range(hdev, 0, ~0x0ull);
 
+    if (vhost_dev_has_iommu(hdev)) {
+        hdev->vhost_ops->vhost_set_iotlb_callback(hdev, false);
+        memory_listener_unregister(&hdev->iommu_listener);
+    }
+    vhost_log_put(hdev, true);
     hdev->started = false;
-    g_free(hdev->log);
-    hdev->log = NULL;
-    hdev->log_size = 0;
+    hdev->vdev = NULL;
 }
 
+int vhost_net_set_backend(struct vhost_dev *hdev,
+                          struct vhost_vring_file *file)
+{
+    if (hdev->vhost_ops->vhost_net_set_backend) {
+        return hdev->vhost_ops->vhost_net_set_backend(hdev, file);
+    }
+
+    return -1;
+}

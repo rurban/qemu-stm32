@@ -25,16 +25,19 @@
    inherit from a particular bus (e.g. PCI or I2C) rather than
    this API directly.  */
 
+#include "qemu/osdep.h"
 #include "hw/qdev.h"
 #include "hw/fw-path-provider.h"
 #include "sysemu/sysemu.h"
-#include "qapi/error.h"
 #include "qapi/qmp/qerror.h"
 #include "qapi/visitor.h"
 #include "qapi/qmp/qjson.h"
+#include "qemu/error-report.h"
 #include "hw/hotplug.h"
 #include "hw/boards.h"
+#include "hw/sysbus.h"
 #include "qapi-event.h"
+#include "migration/migration.h"
 
 int qdev_hotplug = 0;
 static bool qdev_hot_added = false;
@@ -56,9 +59,6 @@ const char *qdev_fw_name(DeviceState *dev)
 
     return object_get_typename(OBJECT(dev));
 }
-
-static void qdev_property_add_legacy(DeviceState *dev, Property *prop,
-                                     Error **errp);
 
 static void bus_remove_child(BusState *bus, DeviceState *child)
 {
@@ -85,10 +85,6 @@ static void bus_add_child(BusState *bus, DeviceState *child)
     char name[32];
     BusChild *kid = g_malloc0(sizeof(*kid));
 
-    if (qdev_hotplug) {
-        assert(bus->allow_hotplug);
-    }
-
     kid->index = bus->max_index++;
     kid->child = child;
     object_ref(OBJECT(kid->child));
@@ -107,14 +103,28 @@ static void bus_add_child(BusState *bus, DeviceState *child)
 
 void qdev_set_parent_bus(DeviceState *dev, BusState *bus)
 {
+    bool replugging = dev->parent_bus != NULL;
+
+    if (replugging) {
+        /* Keep a reference to the device while it's not plugged into
+         * any bus, to avoid it potentially evaporating when it is
+         * dereffed in bus_remove_child().
+         */
+        object_ref(OBJECT(dev));
+        bus_remove_child(dev->parent_bus, dev);
+        object_unref(OBJECT(dev->parent_bus));
+    }
     dev->parent_bus = bus;
     object_ref(OBJECT(bus));
     bus_add_child(bus, dev);
+    if (replugging) {
+        object_unref(OBJECT(dev));
+    }
 }
 
-/* Create a new device.  This only initializes the device state structure
-   and allows properties to be set.  qdev_init should be called to
-   initialize the actual device emulation.  */
+/* Create a new device.  This only initializes the device state
+   structure and allows properties to be set.  The device still needs
+   to be realized.  See qdev-core.h.  */
 DeviceState *qdev_create(BusState *bus, const char *name)
 {
     DeviceState *dev;
@@ -146,6 +156,12 @@ DeviceState *qdev_try_create(BusState *bus, const char *type)
     }
 
     if (!bus) {
+        /* Assert that the device really is a SysBusDevice before
+         * we put it onto the sysbus. Non-sysbus devices which aren't
+         * being put onto a bus should be created with object_new(TYPE_FOO),
+         * not qdev_create(NULL, TYPE_FOO).
+         */
+        g_assert(object_dynamic_cast(OBJECT(dev), TYPE_SYS_BUS_DEVICE));
         bus = sysbus_get_default();
     }
 
@@ -154,25 +170,54 @@ DeviceState *qdev_try_create(BusState *bus, const char *type)
     return dev;
 }
 
-/* Initialize a device.  Device properties should be set before calling
-   this function.  IRQs and MMIO regions should be connected/mapped after
-   calling this function.
-   On failure, destroy the device and return negative value.
-   Return 0 on success.  */
-int qdev_init(DeviceState *dev)
+static QTAILQ_HEAD(device_listeners, DeviceListener) device_listeners
+    = QTAILQ_HEAD_INITIALIZER(device_listeners);
+
+enum ListenerDirection { Forward, Reverse };
+
+#define DEVICE_LISTENER_CALL(_callback, _direction, _args...)     \
+    do {                                                          \
+        DeviceListener *_listener;                                \
+                                                                  \
+        switch (_direction) {                                     \
+        case Forward:                                             \
+            QTAILQ_FOREACH(_listener, &device_listeners, link) {  \
+                if (_listener->_callback) {                       \
+                    _listener->_callback(_listener, ##_args);     \
+                }                                                 \
+            }                                                     \
+            break;                                                \
+        case Reverse:                                             \
+            QTAILQ_FOREACH_REVERSE(_listener, &device_listeners,  \
+                                   device_listeners, link) {      \
+                if (_listener->_callback) {                       \
+                    _listener->_callback(_listener, ##_args);     \
+                }                                                 \
+            }                                                     \
+            break;                                                \
+        default:                                                  \
+            abort();                                              \
+        }                                                         \
+    } while (0)
+
+static int device_listener_add(DeviceState *dev, void *opaque)
 {
-    Error *local_err = NULL;
+    DEVICE_LISTENER_CALL(realize, Forward, dev);
 
-    assert(!dev->realized);
-
-    object_property_set_bool(OBJECT(dev), true, "realized", &local_err);
-    if (local_err != NULL) {
-        qerror_report_err(local_err);
-        error_free(local_err);
-        object_unparent(OBJECT(dev));
-        return -1;
-    }
     return 0;
+}
+
+void device_listener_register(DeviceListener *listener)
+{
+    QTAILQ_INSERT_TAIL(&device_listeners, listener, link);
+
+    qbus_walk_children(sysbus_get_default(), NULL, NULL, device_listener_add,
+                       NULL, NULL);
+}
+
+void device_listener_unregister(DeviceListener *listener)
+{
+    QTAILQ_REMOVE(&device_listeners, listener, link);
 }
 
 static void device_realize(DeviceState *dev, Error **errp)
@@ -209,30 +254,54 @@ void qdev_set_legacy_instance_id(DeviceState *dev, int alias_id,
     dev->alias_required_for_version = required_for_version;
 }
 
+HotplugHandler *qdev_get_hotplug_handler(DeviceState *dev)
+{
+    HotplugHandler *hotplug_ctrl = NULL;
+
+    if (dev->parent_bus && dev->parent_bus->hotplug_handler) {
+        hotplug_ctrl = dev->parent_bus->hotplug_handler;
+    } else if (object_dynamic_cast(qdev_get_machine(), TYPE_MACHINE)) {
+        MachineState *machine = MACHINE(qdev_get_machine());
+        MachineClass *mc = MACHINE_GET_CLASS(machine);
+
+        if (mc->get_hotplug_handler) {
+            hotplug_ctrl = mc->get_hotplug_handler(machine, dev);
+        }
+    }
+    return hotplug_ctrl;
+}
+
 void qdev_unplug(DeviceState *dev, Error **errp)
 {
     DeviceClass *dc = DEVICE_GET_CLASS(dev);
+    HotplugHandler *hotplug_ctrl;
+    HotplugHandlerClass *hdc;
 
-    if (dev->parent_bus && !dev->parent_bus->allow_hotplug) {
-        error_set(errp, QERR_BUS_NO_HOTPLUG, dev->parent_bus->name);
+    if (dev->parent_bus && !qbus_is_hotpluggable(dev->parent_bus)) {
+        error_setg(errp, QERR_BUS_NO_HOTPLUG, dev->parent_bus->name);
         return;
     }
 
     if (!dc->hotpluggable) {
-        error_set(errp, QERR_DEVICE_NO_HOTPLUG,
-                  object_get_typename(OBJECT(dev)));
+        error_setg(errp, QERR_DEVICE_NO_HOTPLUG,
+                   object_get_typename(OBJECT(dev)));
         return;
     }
 
     qdev_hot_removed = true;
 
-    if (dev->parent_bus && dev->parent_bus->hotplug_handler) {
-        hotplug_handler_unplug(dev->parent_bus->hotplug_handler, dev, errp);
+    hotplug_ctrl = qdev_get_hotplug_handler(dev);
+    /* hotpluggable device MUST have HotplugHandler, if it doesn't
+     * then something is very wrong with it */
+    g_assert(hotplug_ctrl);
+
+    /* If device supports async unplug just request it to be done,
+     * otherwise just remove it synchronously */
+    hdc = HOTPLUG_HANDLER_GET_CLASS(hotplug_ctrl);
+    if (hdc->unplug_request) {
+        hotplug_handler_unplug_request(hotplug_ctrl, dev, errp);
     } else {
-        assert(dc->unplug != NULL);
-        if (dc->unplug(dev) < 0) { /* legacy handler */
-            error_set(errp, QERR_UNDEFINED_ERROR);
-        }
+        hotplug_handler_unplug(hotplug_ctrl, dev, errp);
     }
 }
 
@@ -257,6 +326,11 @@ void qdev_reset_all(DeviceState *dev)
     qdev_walk_children(dev, NULL, NULL, qdev_reset_one, qbus_reset_one, NULL);
 }
 
+void qdev_reset_all_fn(void *opaque)
+{
+    qdev_reset_all(DEVICE(opaque));
+}
+
 void qbus_reset_all(BusState *bus)
 {
     qbus_walk_children(bus, NULL, NULL, qdev_reset_one, qbus_reset_one, NULL);
@@ -269,29 +343,40 @@ void qbus_reset_all_fn(void *opaque)
 }
 
 /* can be used as ->unplug() callback for the simple cases */
-int qdev_simple_unplug_cb(DeviceState *dev)
+void qdev_simple_device_unplug_cb(HotplugHandler *hotplug_dev,
+                                  DeviceState *dev, Error **errp)
 {
     /* just zap it */
     object_unparent(OBJECT(dev));
-    return 0;
 }
 
-
-/* Like qdev_init(), but terminate program via error_report() instead of
-   returning an error value.  This is okay during machine creation.
-   Don't use for hotplug, because there callers need to recover from
-   failure.  Exception: if you know the device's init() callback can't
-   fail, then qdev_init_nofail() can't fail either, and is therefore
-   usable even then.  But relying on the device implementation that
-   way is somewhat unclean, and best avoided.  */
+/*
+ * Realize @dev.
+ * Device properties should be set before calling this function.  IRQs
+ * and MMIO regions should be connected/mapped after calling this
+ * function.
+ * On failure, report an error with error_report() and terminate the
+ * program.  This is okay during machine creation.  Don't use for
+ * hotplug, because there callers need to recover from failure.
+ * Exception: if you know the device's init() callback can't fail,
+ * then qdev_init_nofail() can't fail either, and is therefore usable
+ * even then.  But relying on the device implementation that way is
+ * somewhat unclean, and best avoided.
+ */
 void qdev_init_nofail(DeviceState *dev)
 {
-    const char *typename = object_get_typename(OBJECT(dev));
+    Error *err = NULL;
 
-    if (qdev_init(dev) < 0) {
-        error_report("Initialization of device %s failed", typename);
+    assert(!dev->realized);
+
+    object_ref(OBJECT(dev));
+    object_property_set_bool(OBJECT(dev), true, "realized", &err);
+    if (err) {
+        error_reportf_err(err, "Initialization of device %s failed: ",
+                          object_get_typename(OBJECT(dev)));
         exit(1);
     }
+    object_unref(OBJECT(dev));
 }
 
 void qdev_machine_creation_done(void)
@@ -337,10 +422,24 @@ static NamedGPIOList *qdev_get_named_gpio_list(DeviceState *dev,
 void qdev_init_gpio_in_named(DeviceState *dev, qemu_irq_handler handler,
                              const char *name, int n)
 {
+    int i;
     NamedGPIOList *gpio_list = qdev_get_named_gpio_list(dev, name);
 
+    assert(gpio_list->num_out == 0 || !name);
     gpio_list->in = qemu_extend_irqs(gpio_list->in, gpio_list->num_in, handler,
                                      dev, n);
+
+    if (!name) {
+        name = "unnamed-gpio-in";
+    }
+    for (i = gpio_list->num_in; i < gpio_list->num_in + n; i++) {
+        gchar *propname = g_strdup_printf("%s[%u]", name, i);
+
+        object_property_add_child(OBJECT(dev), propname,
+                                  OBJECT(gpio_list->in[i]), &error_abort);
+        g_free(propname);
+    }
+
     gpio_list->num_in += n;
 }
 
@@ -352,11 +451,27 @@ void qdev_init_gpio_in(DeviceState *dev, qemu_irq_handler handler, int n)
 void qdev_init_gpio_out_named(DeviceState *dev, qemu_irq *pins,
                               const char *name, int n)
 {
+    int i;
     NamedGPIOList *gpio_list = qdev_get_named_gpio_list(dev, name);
 
-    assert(gpio_list->num_out == 0);
-    gpio_list->num_out = n;
-    gpio_list->out = pins;
+    assert(gpio_list->num_in == 0 || !name);
+
+    if (!name) {
+        name = "unnamed-gpio-out";
+    }
+    memset(pins, 0, sizeof(*pins) * n);
+    for (i = 0; i < n; ++i) {
+        gchar *propname = g_strdup_printf("%s[%u]", name,
+                                          gpio_list->num_out + i);
+
+        object_property_add_link(OBJECT(dev), propname, TYPE_IRQ,
+                                 (Object **)&pins[i],
+                                 object_property_allow_set_link,
+                                 OBJ_PROP_LINK_UNREF_ON_RELEASE,
+                                 &error_abort);
+        g_free(propname);
+    }
+    gpio_list->num_out += n;
 }
 
 void qdev_init_gpio_out(DeviceState *dev, qemu_irq *pins, int n)
@@ -380,10 +495,56 @@ qemu_irq qdev_get_gpio_in(DeviceState *dev, int n)
 void qdev_connect_gpio_out_named(DeviceState *dev, const char *name, int n,
                                  qemu_irq pin)
 {
-    NamedGPIOList *gpio_list = qdev_get_named_gpio_list(dev, name);
+    char *propname = g_strdup_printf("%s[%d]",
+                                     name ? name : "unnamed-gpio-out", n);
+    if (pin) {
+        /* We need a name for object_property_set_link to work.  If the
+         * object has a parent, object_property_add_child will come back
+         * with an error without doing anything.  If it has none, it will
+         * never fail.  So we can just call it with a NULL Error pointer.
+         */
+        object_property_add_child(container_get(qdev_get_machine(),
+                                                "/unattached"),
+                                  "non-qdev-gpio[*]", OBJECT(pin), NULL);
+    }
+    object_property_set_link(OBJECT(dev), OBJECT(pin), propname, &error_abort);
+    g_free(propname);
+}
 
-    assert(n >= 0 && n < gpio_list->num_out);
-    gpio_list->out[n] = pin;
+qemu_irq qdev_get_gpio_out_connector(DeviceState *dev, const char *name, int n)
+{
+    char *propname = g_strdup_printf("%s[%d]",
+                                     name ? name : "unnamed-gpio-out", n);
+
+    qemu_irq ret = (qemu_irq)object_property_get_link(OBJECT(dev), propname,
+                                                      NULL);
+
+    return ret;
+}
+
+/* disconnect a GPIO output, returning the disconnected input (if any) */
+
+static qemu_irq qdev_disconnect_gpio_out_named(DeviceState *dev,
+                                               const char *name, int n)
+{
+    char *propname = g_strdup_printf("%s[%d]",
+                                     name ? name : "unnamed-gpio-out", n);
+
+    qemu_irq ret = (qemu_irq)object_property_get_link(OBJECT(dev), propname,
+                                                      NULL);
+    if (ret) {
+        object_property_set_link(OBJECT(dev), NULL, propname, NULL);
+    }
+    g_free(propname);
+    return ret;
+}
+
+qemu_irq qdev_intercept_gpio_out(DeviceState *dev, qemu_irq icpt,
+                                 const char *name, int n)
+{
+    qemu_irq disconnected = qdev_disconnect_gpio_out_named(dev, name, n);
+    qdev_connect_gpio_out_named(dev, name, n, icpt);
+    return disconnected;
 }
 
 void qdev_connect_gpio_out(DeviceState * dev, int n, qemu_irq pin)
@@ -391,9 +552,43 @@ void qdev_connect_gpio_out(DeviceState * dev, int n, qemu_irq pin)
     qdev_connect_gpio_out_named(dev, NULL, n, pin);
 }
 
+void qdev_pass_gpios(DeviceState *dev, DeviceState *container,
+                     const char *name)
+{
+    int i;
+    NamedGPIOList *ngl = qdev_get_named_gpio_list(dev, name);
+
+    for (i = 0; i < ngl->num_in; i++) {
+        const char *nm = ngl->name ? ngl->name : "unnamed-gpio-in";
+        char *propname = g_strdup_printf("%s[%d]", nm, i);
+
+        object_property_add_alias(OBJECT(container), propname,
+                                  OBJECT(dev), propname,
+                                  &error_abort);
+        g_free(propname);
+    }
+    for (i = 0; i < ngl->num_out; i++) {
+        const char *nm = ngl->name ? ngl->name : "unnamed-gpio-out";
+        char *propname = g_strdup_printf("%s[%d]", nm, i);
+
+        object_property_add_alias(OBJECT(container), propname,
+                                  OBJECT(dev), propname,
+                                  &error_abort);
+        g_free(propname);
+    }
+    QLIST_REMOVE(ngl, node);
+    QLIST_INSERT_HEAD(&container->gpios, ngl, node);
+}
+
 BusState *qdev_get_child_bus(DeviceState *dev, const char *name)
 {
     BusState *bus;
+    Object *child = object_resolve_path_component(OBJECT(dev), name);
+
+    bus = (BusState *)object_dynamic_cast(child, TYPE_BUS);
+    if (bus) {
+        return bus;
+    }
 
     QLIST_FOREACH(bus, &dev->child_bus, sibling) {
         if (strcmp(name, bus->name) == 0) {
@@ -401,40 +596,6 @@ BusState *qdev_get_child_bus(DeviceState *dev, const char *name)
         }
     }
     return NULL;
-}
-
-int qbus_walk_children(BusState *bus,
-                       qdev_walkerfn *pre_devfn, qbus_walkerfn *pre_busfn,
-                       qdev_walkerfn *post_devfn, qbus_walkerfn *post_busfn,
-                       void *opaque)
-{
-    BusChild *kid;
-    int err;
-
-    if (pre_busfn) {
-        err = pre_busfn(bus, opaque);
-        if (err) {
-            return err;
-        }
-    }
-
-    QTAILQ_FOREACH(kid, &bus->children, sibling) {
-        err = qdev_walk_children(kid->child,
-                                 pre_devfn, pre_busfn,
-                                 post_devfn, post_busfn, opaque);
-        if (err < 0) {
-            return err;
-        }
-    }
-
-    if (post_busfn) {
-        err = post_busfn(bus, opaque);
-        if (err) {
-            return err;
-        }
-    }
-
-    return 0;
 }
 
 int qdev_walk_children(DeviceState *dev,
@@ -493,129 +654,6 @@ DeviceState *qdev_find_recursive(BusState *bus, const char *id)
     return NULL;
 }
 
-static void qbus_realize(BusState *bus, DeviceState *parent, const char *name)
-{
-    const char *typename = object_get_typename(OBJECT(bus));
-    BusClass *bc;
-    char *buf;
-    int i, len, bus_id;
-
-    bus->parent = parent;
-
-    if (name) {
-        bus->name = g_strdup(name);
-    } else if (bus->parent && bus->parent->id) {
-        /* parent device has id -> use it plus parent-bus-id for bus name */
-        bus_id = bus->parent->num_child_bus;
-
-        len = strlen(bus->parent->id) + 16;
-        buf = g_malloc(len);
-        snprintf(buf, len, "%s.%d", bus->parent->id, bus_id);
-        bus->name = buf;
-    } else {
-        /* no id -> use lowercase bus type plus global bus-id for bus name */
-        bc = BUS_GET_CLASS(bus);
-        bus_id = bc->automatic_ids++;
-
-        len = strlen(typename) + 16;
-        buf = g_malloc(len);
-        len = snprintf(buf, len, "%s.%d", typename, bus_id);
-        for (i = 0; i < len; i++) {
-            buf[i] = qemu_tolower(buf[i]);
-        }
-        bus->name = buf;
-    }
-
-    if (bus->parent) {
-        QLIST_INSERT_HEAD(&bus->parent->child_bus, bus, sibling);
-        bus->parent->num_child_bus++;
-        object_property_add_child(OBJECT(bus->parent), bus->name, OBJECT(bus), NULL);
-        object_unref(OBJECT(bus));
-    } else if (bus != sysbus_get_default()) {
-        /* TODO: once all bus devices are qdevified,
-           only reset handler for main_system_bus should be registered here. */
-        qemu_register_reset(qbus_reset_all_fn, bus);
-    }
-}
-
-static void bus_unparent(Object *obj)
-{
-    BusState *bus = BUS(obj);
-    BusChild *kid;
-
-    while ((kid = QTAILQ_FIRST(&bus->children)) != NULL) {
-        DeviceState *dev = kid->child;
-        object_unparent(OBJECT(dev));
-    }
-    if (bus->parent) {
-        QLIST_REMOVE(bus, sibling);
-        bus->parent->num_child_bus--;
-        bus->parent = NULL;
-    } else {
-        assert(bus != sysbus_get_default()); /* main_system_bus is never freed */
-        qemu_unregister_reset(qbus_reset_all_fn, bus);
-    }
-}
-
-static bool bus_get_realized(Object *obj, Error **errp)
-{
-    BusState *bus = BUS(obj);
-
-    return bus->realized;
-}
-
-static void bus_set_realized(Object *obj, bool value, Error **errp)
-{
-    BusState *bus = BUS(obj);
-    BusClass *bc = BUS_GET_CLASS(bus);
-    BusChild *kid;
-    Error *local_err = NULL;
-
-    if (value && !bus->realized) {
-        if (bc->realize) {
-            bc->realize(bus, &local_err);
-        }
-
-        /* TODO: recursive realization */
-    } else if (!value && bus->realized) {
-        QTAILQ_FOREACH(kid, &bus->children, sibling) {
-            DeviceState *dev = kid->child;
-            object_property_set_bool(OBJECT(dev), false, "realized",
-                                     &local_err);
-            if (local_err != NULL) {
-                break;
-            }
-        }
-        if (bc->unrealize && local_err == NULL) {
-            bc->unrealize(bus, &local_err);
-        }
-    }
-
-    if (local_err != NULL) {
-        error_propagate(errp, local_err);
-        return;
-    }
-
-    bus->realized = value;
-}
-
-void qbus_create_inplace(void *bus, size_t size, const char *typename,
-                         DeviceState *parent, const char *name)
-{
-    object_initialize(bus, size, typename);
-    qbus_realize(bus, parent, name);
-}
-
-BusState *qbus_create(const char *typename, DeviceState *parent, const char *name)
-{
-    BusState *bus;
-
-    bus = BUS(object_new(typename));
-    qbus_realize(bus, parent, name);
-
-    return bus;
-}
-
 static char *bus_get_fw_dev_path(BusState *bus, DeviceState *dev)
 {
     BusClass *bc = BUS_GET_CLASS(bus);
@@ -637,6 +675,13 @@ static char *qdev_get_fw_dev_path_from_handler(BusState *bus, DeviceState *dev)
         d = fw_path_provider_try_get_dev_path(obj, bus, dev);
     }
     return d;
+}
+
+char *qdev_get_own_fw_dev_path_from_handler(BusState *bus, DeviceState *dev)
+{
+    Object *obj = OBJECT(dev);
+
+    return fw_path_provider_try_get_dev_path(obj, bus, dev);
 }
 
 static int qdev_get_fw_dev_path_helper(DeviceState *dev, char *p, int size)
@@ -694,8 +739,9 @@ char *qdev_get_dev_path(DeviceState *dev)
  * Legacy property handling
  */
 
-static void qdev_get_legacy_property(Object *obj, Visitor *v, void *opaque,
-                                     const char *name, Error **errp)
+static void qdev_get_legacy_property(Object *obj, Visitor *v,
+                                     const char *name, void *opaque,
+                                     Error **errp)
 {
     DeviceState *dev = DEVICE(obj);
     Property *prop = opaque;
@@ -704,17 +750,24 @@ static void qdev_get_legacy_property(Object *obj, Visitor *v, void *opaque,
     char *ptr = buffer;
 
     prop->info->print(dev, prop, buffer, sizeof(buffer));
-    visit_type_str(v, &ptr, name, errp);
+    visit_type_str(v, name, &ptr, errp);
 }
 
 /**
- * @qdev_add_legacy_property - adds a legacy property
+ * qdev_property_add_legacy:
+ * @dev: Device to add the property to.
+ * @prop: The qdev property definition.
+ * @errp: location to store error information.
  *
- * Do not use this is new code!  Properties added through this interface will
- * be given names and types in the "legacy" namespace.
+ * Add a legacy QOM property to @dev for qdev property @prop.
+ * On error, store error in @errp.
  *
- * Legacy properties are string versions of other OOM properties.  The format
- * of the string depends on the property type.
+ * Legacy properties are string versions of QOM properties.  The format of
+ * the string depends on the property type.  Legacy properties are only
+ * needed for "info qtree".
+ *
+ * Do not use this is new code!  QOM Properties added through this interface
+ * will be given names in the "legacy" namespace.
  */
 static void qdev_property_add_legacy(DeviceState *dev, Property *prop,
                                      Error **errp)
@@ -737,10 +790,14 @@ static void qdev_property_add_legacy(DeviceState *dev, Property *prop,
 }
 
 /**
- * @qdev_property_add_static - add a @Property to a device.
+ * qdev_property_add_static:
+ * @dev: Device to add the property to.
+ * @prop: The qdev property definition.
+ * @errp: location to store error information.
  *
- * Static properties access data in a struct.  The actual type of the
- * property and the field depends on the property type.
+ * Add a static QOM property to @dev for qdev property @prop.
+ * On error, store error in @errp.  Static properties access data in a struct.
+ * The type of the QOM property is derived from prop->info.
  */
 void qdev_property_add_static(DeviceState *dev, Property *prop,
                               Error **errp)
@@ -766,6 +823,11 @@ void qdev_property_add_static(DeviceState *dev, Property *prop,
         error_propagate(errp, local_err);
         return;
     }
+
+    object_property_set_description(obj, prop->name,
+                                    prop->info->description,
+                                    &error_abort);
+
     if (prop->qtype == QTYPE_NONE) {
         return;
     }
@@ -801,6 +863,32 @@ void qdev_alias_all_properties(DeviceState *target, Object *source)
     } while (class != object_class_by_name(TYPE_DEVICE));
 }
 
+static int qdev_add_hotpluggable_device(Object *obj, void *opaque)
+{
+    GSList **list = opaque;
+    DeviceState *dev = (DeviceState *)object_dynamic_cast(OBJECT(obj),
+                                                          TYPE_DEVICE);
+
+    if (dev == NULL) {
+        return 0;
+    }
+
+    if (dev->realized && object_property_get_bool(obj, "hotpluggable", NULL)) {
+        *list = g_slist_append(*list, dev);
+    }
+
+    return 0;
+}
+
+GSList *qdev_build_hotpluggable_device_list(Object *peripheral)
+{
+    GSList *list = NULL;
+
+    object_child_foreach(peripheral, qdev_add_hotpluggable_device, &list);
+
+    return list;
+}
+
 static bool device_get_realized(Object *obj, Error **errp)
 {
     DeviceState *dev = DEVICE(obj);
@@ -811,23 +899,40 @@ static void device_set_realized(Object *obj, bool value, Error **errp)
 {
     DeviceState *dev = DEVICE(obj);
     DeviceClass *dc = DEVICE_GET_CLASS(dev);
+    HotplugHandler *hotplug_ctrl;
     BusState *bus;
     Error *local_err = NULL;
+    bool unattached_parent = false;
+    static int unattached_count;
+    int ret;
 
     if (dev->hotplugged && !dc->hotpluggable) {
-        error_set(errp, QERR_DEVICE_NO_HOTPLUG, object_get_typename(obj));
+        error_setg(errp, QERR_DEVICE_NO_HOTPLUG, object_get_typename(obj));
         return;
     }
 
     if (value && !dev->realized) {
-        if (!obj->parent && local_err == NULL) {
-            static int unattached_count;
+        ret = check_migratable(obj, &local_err);
+        if (ret < 0) {
+            goto fail;
+        }
+
+        if (!obj->parent) {
             gchar *name = g_strdup_printf("device[%d]", unattached_count++);
 
             object_property_add_child(container_get(qdev_get_machine(),
                                                     "/unattached"),
-                                      name, obj, &local_err);
+                                      name, obj, &error_abort);
+            unattached_parent = true;
             g_free(name);
+        }
+
+        hotplug_ctrl = qdev_get_hotplug_handler(dev);
+        if (hotplug_ctrl) {
+            hotplug_handler_pre_plug(hotplug_ctrl, dev, &local_err);
+            if (local_err != NULL) {
+                goto fail;
+            }
         }
 
         if (dc->realize) {
@@ -838,20 +943,10 @@ static void device_set_realized(Object *obj, bool value, Error **errp)
             goto fail;
         }
 
-        if (dev->parent_bus && dev->parent_bus->hotplug_handler) {
-            hotplug_handler_plug(dev->parent_bus->hotplug_handler,
-                                 dev, &local_err);
-        } else if (object_dynamic_cast(qdev_get_machine(), TYPE_MACHINE)) {
-            HotplugHandler *hotplug_ctrl;
-            MachineState *machine = MACHINE(qdev_get_machine());
-            MachineClass *mc = MACHINE_GET_CLASS(machine);
+        DEVICE_LISTENER_CALL(realize, Forward, dev);
 
-            if (mc->get_hotplug_handler) {
-                hotplug_ctrl = mc->get_hotplug_handler(machine, dev);
-                if (hotplug_ctrl) {
-                    hotplug_handler_plug(hotplug_ctrl, dev, &local_err);
-                }
-            }
+        if (hotplug_ctrl) {
+            hotplug_handler_plug(hotplug_ctrl, dev, &local_err);
         }
 
         if (local_err != NULL) {
@@ -859,9 +954,12 @@ static void device_set_realized(Object *obj, bool value, Error **errp)
         }
 
         if (qdev_get_vmsd(dev)) {
-            vmstate_register_with_alias_id(dev, -1, qdev_get_vmsd(dev), dev,
-                                           dev->instance_id_alias,
-                                           dev->alias_required_for_version);
+            if (vmstate_register_with_alias_id(dev, -1, qdev_get_vmsd(dev), dev,
+                                               dev->instance_id_alias,
+                                               dev->alias_required_for_version,
+                                               &local_err) < 0) {
+                goto post_realize_fail;
+            }
         }
 
         QLIST_FOREACH(bus, &dev->child_bus, sibling) {
@@ -890,6 +988,7 @@ static void device_set_realized(Object *obj, bool value, Error **errp)
             dc->unrealize(dev, local_errp);
         }
         dev->pending_deleted_event = true;
+        DEVICE_LISTENER_CALL(unrealize, Reverse, dev);
     }
 
     if (local_err != NULL) {
@@ -916,7 +1015,10 @@ post_realize_fail:
 
 fail:
     error_propagate(errp, local_err);
-    return;
+    if (unattached_parent) {
+        object_unparent(OBJECT(dev));
+        unattached_count--;
+    }
 }
 
 static bool device_get_hotpluggable(Object *obj, Error **errp)
@@ -925,7 +1027,7 @@ static bool device_get_hotpluggable(Object *obj, Error **errp)
     DeviceState *dev = DEVICE(obj);
 
     return dc->hotpluggable && (dev->parent_bus == NULL ||
-                                dev->parent_bus->allow_hotplug);
+                                qbus_is_hotpluggable(dev->parent_bus));
 }
 
 static bool device_get_hotplugged(Object *obj, Error **err)
@@ -981,13 +1083,7 @@ static void device_initfn(Object *obj)
 
 static void device_post_init(Object *obj)
 {
-    Error *err = NULL;
-    qdev_prop_set_globals(DEVICE(obj), &err);
-    if (err) {
-        qerror_report_err(err);
-        error_free(err);
-        exit(EXIT_FAILURE);
-    }
+    qdev_prop_set_globals(DEVICE(obj));
 }
 
 /* Unlink device from bus and free the structure.  */
@@ -996,9 +1092,6 @@ static void device_finalize(Object *obj)
     NamedGPIOList *ngl, *next;
 
     DeviceState *dev = DEVICE(obj);
-    if (dev->opts) {
-        qemu_opts_del(dev->opts);
-    }
 
     QLIST_FOREACH_SAFE(ngl, &dev->gpios, node, next) {
         QLIST_REMOVE(ngl, node);
@@ -1046,6 +1139,9 @@ static void device_unparent(Object *obj)
         qapi_event_send_device_deleted(!!dev->id, dev->id, path, &error_abort);
         g_free(path);
     }
+
+    qemu_opts_del(dev->opts);
+    dev->opts = NULL;
 }
 
 static void device_class_init(ObjectClass *class, void *data)
@@ -1063,6 +1159,7 @@ static void device_class_init(ObjectClass *class, void *data)
      * should override it in their class_init()
      */
     dc->hotpluggable = true;
+    dc->user_creatable = true;
 }
 
 void device_reset(DeviceState *dev)
@@ -1098,55 +1195,8 @@ static const TypeInfo device_type_info = {
     .class_size = sizeof(DeviceClass),
 };
 
-static void qbus_initfn(Object *obj)
-{
-    BusState *bus = BUS(obj);
-
-    QTAILQ_INIT(&bus->children);
-    object_property_add_link(obj, QDEV_HOTPLUG_HANDLER_PROPERTY,
-                             TYPE_HOTPLUG_HANDLER,
-                             (Object **)&bus->hotplug_handler,
-                             object_property_allow_set_link,
-                             OBJ_PROP_LINK_UNREF_ON_RELEASE,
-                             NULL);
-    object_property_add_bool(obj, "realized",
-                             bus_get_realized, bus_set_realized, NULL);
-}
-
-static char *default_bus_get_fw_dev_path(DeviceState *dev)
-{
-    return g_strdup(object_get_typename(OBJECT(dev)));
-}
-
-static void bus_class_init(ObjectClass *class, void *data)
-{
-    BusClass *bc = BUS_CLASS(class);
-
-    class->unparent = bus_unparent;
-    bc->get_fw_dev_path = default_bus_get_fw_dev_path;
-}
-
-static void qbus_finalize(Object *obj)
-{
-    BusState *bus = BUS(obj);
-
-    g_free((char *)bus->name);
-}
-
-static const TypeInfo bus_info = {
-    .name = TYPE_BUS,
-    .parent = TYPE_OBJECT,
-    .instance_size = sizeof(BusState),
-    .abstract = true,
-    .class_size = sizeof(BusClass),
-    .instance_init = qbus_initfn,
-    .instance_finalize = qbus_finalize,
-    .class_init = bus_class_init,
-};
-
 static void qdev_register_types(void)
 {
-    type_register_static(&bus_info);
     type_register_static(&device_type_info);
 }
 

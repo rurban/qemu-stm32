@@ -11,9 +11,10 @@
  *
  */
 
+#include "qemu/osdep.h"
 #include "qed.h"
 
-void *gencb_alloc(size_t len, BlockDriverCompletionFunc *cb, void *opaque)
+void *gencb_alloc(size_t len, BlockCompletionFunc *cb, void *opaque)
 {
     GenericCB *gencb = g_malloc(len);
     gencb->cb = cb;
@@ -24,7 +25,7 @@ void *gencb_alloc(size_t len, BlockDriverCompletionFunc *cb, void *opaque)
 void gencb_complete(void *opaque, int ret)
 {
     GenericCB *gencb = opaque;
-    BlockDriverCompletionFunc *cb = gencb->cb;
+    BlockCompletionFunc *cb = gencb->cb;
     void *user_opaque = gencb->opaque;
 
     g_free(gencb);

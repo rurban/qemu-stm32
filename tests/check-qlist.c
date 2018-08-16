@@ -9,7 +9,7 @@
  * This work is licensed under the terms of the GNU LGPL, version 2.1 or later.
  * See the COPYING.LIB file in the top-level directory.
  */
-#include <glib.h>
+#include "qemu/osdep.h"
 
 #include "qapi/qmp/qint.h"
 #include "qapi/qmp/qlist.h"
@@ -74,7 +74,7 @@ static void qlist_destroy_test(void)
     qlist = qlist_new();
 
     for (i = 0; i < 42; i++)
-        qlist_append(qlist, qint_from_int(i));
+        qlist_append_int(qlist, i);
 
     QDECREF(qlist);
 }
@@ -103,7 +103,7 @@ static void qlist_iter_test(void)
     qlist = qlist_new();
 
     for (i = 0; i < iter_max; i++)
-        qlist_append(qlist, qint_from_int(i));
+        qlist_append_int(qlist, i);
 
     iter_called = 0;
     qlist_iter(qlist, iter_func, NULL);

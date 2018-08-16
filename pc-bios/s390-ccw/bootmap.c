@@ -33,18 +33,13 @@ typedef struct ResetInfo {
     uint32_t ipl_continue;
 } ResetInfo;
 
-ResetInfo save;
+static ResetInfo save;
 
 static void jump_to_IPL_2(void)
 {
     ResetInfo *current = 0;
 
     void (*ipl)(void) = (void *) (uint64_t) current->ipl_continue;
-    debug_print_addr("set IPL addr to", ipl);
-
-    /* Ensure the guest output starts fresh */
-    sclp_print("\n");
-
     *current = save;
     ipl(); /* should not return */
 }
@@ -64,6 +59,11 @@ static void jump_to_IPL_code(uint64_t address)
     current->ipl_addr = (uint32_t) (uint64_t) &jump_to_IPL_2;
     current->ipl_continue = address & 0x7fffffff;
 
+    debug_print_int("set IPL addr to", current->ipl_continue);
+
+    /* Ensure the guest output starts fresh */
+    sclp_print("\n");
+
     /*
      * HACK ALERT.
      * We use the load normal reset to keep r15 unchanged. jump_to_IPL_2
@@ -72,7 +72,7 @@ static void jump_to_IPL_code(uint64_t address)
     asm volatile("lghi 1,1\n\t"
                  "diag 1,1,0x308\n\t"
                  : : : "1", "memory");
-    virtio_panic("\n! IPL returns !\n");
+    panic("\n! IPL returns !\n");
 }
 
 /***********************************************************************
@@ -80,36 +80,17 @@ static void jump_to_IPL_code(uint64_t address)
  */
 
 static unsigned char _bprs[8*1024]; /* guessed "max" ECKD sector size */
-const int max_bprs_entries = sizeof(_bprs) / sizeof(ExtEckdBlockPtr);
+static const int max_bprs_entries = sizeof(_bprs) / sizeof(ExtEckdBlockPtr);
 
 static inline void verify_boot_info(BootInfo *bip)
 {
-    IPL_assert(magic_match(bip->magic, ZIPL_MAGIC), "No zIPL magic");
+    IPL_assert(magic_match(bip->magic, ZIPL_MAGIC), "No zIPL sig in BootInfo");
     IPL_assert(bip->version == BOOT_INFO_VERSION, "Wrong zIPL version");
     IPL_assert(bip->bp_type == BOOT_INFO_BP_TYPE_IPL, "DASD is not for IPL");
     IPL_assert(bip->dev_type == BOOT_INFO_DEV_TYPE_ECKD, "DASD is not ECKD");
     IPL_assert(bip->flags == BOOT_INFO_FLAGS_ARCH, "Not for this arch");
     IPL_assert(block_size_ok(bip->bp.ipl.bm_ptr.eckd.bptr.size),
                "Bad block size in zIPL section of the 1st record.");
-}
-
-static bool eckd_valid_address(BootMapPointer *p)
-{
-    const uint64_t cylinder = p->eckd.cylinder
-                            + ((p->eckd.head & 0xfff0) << 12);
-    const uint64_t head = p->eckd.head & 0x000f;
-
-    if (head >= virtio_get_heads()
-        ||  p->eckd.sector > virtio_get_sectors()
-        ||  p->eckd.sector <= 0) {
-        return false;
-    }
-
-    if (!virtio_guessed_disk_nature() && cylinder >= virtio_get_cylinders()) {
-        return false;
-    }
-
-    return true;
 }
 
 static block_number_t eckd_block_num(BootMapPointer *p)
@@ -124,6 +105,24 @@ static block_number_t eckd_block_num(BootMapPointer *p)
                                + p->eckd.sector
                                - 1; /* block nr starts with zero */
     return block;
+}
+
+static bool eckd_valid_address(BootMapPointer *p)
+{
+    const uint64_t head = p->eckd.head & 0x000f;
+
+    if (head >= virtio_get_heads()
+        ||  p->eckd.sector > virtio_get_sectors()
+        ||  p->eckd.sector <= 0) {
+        return false;
+    }
+
+    if (!virtio_guessed_disk_nature() &&
+        eckd_block_num(p) >= virtio_get_blocks()) {
+        return false;
+    }
+
+    return true;
 }
 
 static block_number_t load_eckd_segments(block_number_t blk, uint64_t *address)
@@ -223,7 +222,6 @@ static void ipl_eckd_cdl(void)
 
     memset(sec, FREE_SPACE_FILLER, sizeof(sec));
     read_block(1, ipl2, "Cannot read IPL2 record at block 1");
-    IPL_assert(magic_match(ipl2, IPL2_MAGIC), "No IPL2 record");
 
     mbr = &ipl2->u.x.mbr;
     IPL_assert(magic_match(mbr, ZIPL_MAGIC), "No zIPL section in IPL2 record.");
@@ -247,12 +245,10 @@ static void ipl_eckd_cdl(void)
     /* no return */
 }
 
-static void ipl_eckd_ldl(ECKD_IPL_mode_t mode)
+static void print_eckd_ldl_msg(ECKD_IPL_mode_t mode)
 {
     LDL_VTOC *vlbl = (void *)sec; /* already read, 3rd block */
     char msg[4] = { '?', '.', '\n', '\0' };
-    block_number_t block_nr;
-    BootInfo *bip;
 
     sclp_print((mode == ECKD_CMS) ? "CMS" : "LDL");
     sclp_print(" version ");
@@ -272,12 +268,27 @@ static void ipl_eckd_ldl(ECKD_IPL_mode_t mode)
     }
     sclp_print(msg);
     print_volser(vlbl->volser);
+}
+
+static void ipl_eckd_ldl(ECKD_IPL_mode_t mode)
+{
+    block_number_t block_nr;
+    BootInfo *bip = (void *)(sec + 0x70); /* BootInfo is MBR for LDL */
+
+    if (mode != ECKD_LDL_UNLABELED) {
+        print_eckd_ldl_msg(mode);
+    }
 
     /* DO NOT read BootMap pointer (only one, xECKD) at block #2 */
 
     memset(sec, FREE_SPACE_FILLER, sizeof(sec));
-    read_block(0, sec, "Cannot read block 0");
-    bip = (void *)(sec + 0x70); /* "boot info" is "eckd mbr" for LDL */
+    read_block(0, sec, "Cannot read block 0 to grab boot info.");
+    if (mode == ECKD_LDL_UNLABELED) {
+        if (!magic_match(bip->magic, ZIPL_MAGIC)) {
+            return; /* not applicable layout */
+        }
+        sclp_print("unlabeled LDL.\n");
+    }
     verify_boot_info(bip);
 
     block_nr = eckd_block_num((void *)&(bip->bp.ipl.bm_ptr.eckd.bptr));
@@ -285,17 +296,57 @@ static void ipl_eckd_ldl(ECKD_IPL_mode_t mode)
     /* no return */
 }
 
-static void ipl_eckd(ECKD_IPL_mode_t mode)
+static void print_eckd_msg(void)
 {
-    switch (mode) {
-    case ECKD_CDL:
-        ipl_eckd_cdl(); /* no return */
-    case ECKD_CMS:
-    case ECKD_LDL:
-        ipl_eckd_ldl(mode); /* no return */
-    default:
-        virtio_panic("\n! Unknown ECKD IPL mode !\n");
+    char msg[] = "Using ECKD scheme (block size *****), ";
+    char *p = &msg[34], *q = &msg[30];
+    int n = virtio_get_block_size();
+
+    /* Fill in the block size and show up the message */
+    if (n > 0 && n <= 99999) {
+        while (n) {
+            *p-- = '0' + (n % 10);
+            n /= 10;
+        }
+        while (p >= q) {
+            *p-- = ' ';
+        }
     }
+    sclp_print(msg);
+}
+
+static void ipl_eckd(void)
+{
+    ScsiMbr *mbr = (void *)sec;
+    LDL_VTOC *vlbl = (void *)sec;
+
+    print_eckd_msg();
+
+    /* Grab the MBR again */
+    memset(sec, FREE_SPACE_FILLER, sizeof(sec));
+    read_block(0, mbr, "Cannot read block 0 on DASD");
+
+    if (magic_match(mbr->magic, IPL1_MAGIC)) {
+        ipl_eckd_cdl(); /* no return */
+    }
+
+    /* LDL/CMS? */
+    memset(sec, FREE_SPACE_FILLER, sizeof(sec));
+    read_block(2, vlbl, "Cannot read block 2");
+
+    if (magic_match(vlbl->magic, CMS1_MAGIC)) {
+        ipl_eckd_ldl(ECKD_CMS); /* no return */
+    }
+    if (magic_match(vlbl->magic, LNX1_MAGIC)) {
+        ipl_eckd_ldl(ECKD_LDL); /* no return */
+    }
+
+    ipl_eckd_ldl(ECKD_LDL_UNLABELED); /* it still may return */
+    /*
+     * Ok, it is not a LDL by any means.
+     * It still might be a CDL with zero record keys for IPL1 and IPL2
+     */
+    ipl_eckd_cdl();
 }
 
 /***********************************************************************
@@ -365,7 +416,7 @@ static void zipl_run(ScsiBlockPtr *pte)
     read_block(pte->blockno, tmp_sec, "Cannot read header");
     header = (ComponentHeader *)tmp_sec;
 
-    IPL_assert(magic_match(tmp_sec, ZIPL_MAGIC), "No zIPL magic");
+    IPL_assert(magic_match(tmp_sec, ZIPL_MAGIC), "No zIPL magic in header");
     IPL_assert(header->type == ZIPL_COMP_HEADER_IPL, "Bad header type");
 
     dputs("start loading images\n");
@@ -395,19 +446,29 @@ static void ipl_scsi(void)
     const int pte_len = sizeof(ScsiBlockPtr);
     ScsiBlockPtr *prog_table_entry;
 
-    /* The 0-th block (MBR) was already read into sec[] */
+    /* Grab the MBR */
+    memset(sec, FREE_SPACE_FILLER, sizeof(sec));
+    read_block(0, mbr, "Cannot read block 0");
+
+    if (!magic_match(mbr->magic, ZIPL_MAGIC)) {
+        return;
+    }
 
     sclp_print("Using SCSI scheme.\n");
+    debug_print_int("MBR Version", mbr->version_id);
+    IPL_check(mbr->version_id == 1,
+              "Unknown MBR layout version, assuming version 1");
     debug_print_int("program table", mbr->blockptr.blockno);
+    IPL_assert(mbr->blockptr.blockno, "No Program Table");
 
     /* Parse the program table */
     read_block(mbr->blockptr.blockno, sec,
                "Error reading Program Table");
 
-    IPL_assert(magic_match(sec, ZIPL_MAGIC), "No zIPL magic");
+    IPL_assert(magic_match(sec, ZIPL_MAGIC), "No zIPL magic in PT");
 
     ns_end = sec + virtio_get_block_size();
-    for (ns = (sec + pte_len); (ns + pte_len) < ns_end; ns++) {
+    for (ns = (sec + pte_len); (ns + pte_len) < ns_end; ns += pte_len) {
         prog_table_entry = (ScsiBlockPtr *)ns;
         if (!prog_table_entry->blockno) {
             break;
@@ -428,45 +489,264 @@ static void ipl_scsi(void)
 }
 
 /***********************************************************************
+ * IPL El Torito ISO9660 image or DVD
+ */
+
+static bool is_iso_bc_entry_compatible(IsoBcSection *s)
+{
+    uint8_t *magic_sec = (uint8_t *)(sec + ISO_SECTOR_SIZE);
+
+    if (s->unused || !s->sector_count) {
+        return false;
+    }
+    read_iso_sector(bswap32(s->load_rba), magic_sec,
+                    "Failed to read image sector 0");
+
+    /* Checking bytes 8 - 32 for S390 Linux magic */
+    return !_memcmp(magic_sec + 8, linux_s390_magic, 24);
+}
+
+/* Location of the current sector of the directory */
+static uint32_t sec_loc[ISO9660_MAX_DIR_DEPTH];
+/* Offset in the current sector of the directory */
+static uint32_t sec_offset[ISO9660_MAX_DIR_DEPTH];
+/* Remained directory space in bytes */
+static uint32_t dir_rem[ISO9660_MAX_DIR_DEPTH];
+
+static inline uint32_t iso_get_file_size(uint32_t load_rba)
+{
+    IsoVolDesc *vd = (IsoVolDesc *)sec;
+    IsoDirHdr *cur_record = &vd->vd.primary.rootdir;
+    uint8_t *temp = sec + ISO_SECTOR_SIZE;
+    int level = 0;
+
+    read_iso_sector(ISO_PRIMARY_VD_SECTOR, sec,
+                    "Failed to read ISO primary descriptor");
+    sec_loc[0] = iso_733_to_u32(cur_record->ext_loc);
+    dir_rem[0] = 0;
+    sec_offset[0] = 0;
+
+    while (level >= 0) {
+        IPL_assert(sec_offset[level] <= ISO_SECTOR_SIZE,
+                   "Directory tree structure violation");
+
+        cur_record = (IsoDirHdr *)(temp + sec_offset[level]);
+
+        if (sec_offset[level] == 0) {
+            read_iso_sector(sec_loc[level], temp,
+                            "Failed to read ISO directory");
+            if (dir_rem[level] == 0) {
+                /* Skip self and parent records */
+                dir_rem[level] = iso_733_to_u32(cur_record->data_len) -
+                                 cur_record->dr_len;
+                sec_offset[level] += cur_record->dr_len;
+
+                cur_record = (IsoDirHdr *)(temp + sec_offset[level]);
+                dir_rem[level] -= cur_record->dr_len;
+                sec_offset[level] += cur_record->dr_len;
+                continue;
+            }
+        }
+
+        if (!cur_record->dr_len || sec_offset[level] == ISO_SECTOR_SIZE) {
+            /* Zero-padding and/or the end of current sector */
+            dir_rem[level] -= ISO_SECTOR_SIZE - sec_offset[level];
+            sec_offset[level] = 0;
+            sec_loc[level]++;
+        } else {
+            /* The directory record is valid */
+            if (load_rba == iso_733_to_u32(cur_record->ext_loc)) {
+                return iso_733_to_u32(cur_record->data_len);
+            }
+
+            dir_rem[level] -= cur_record->dr_len;
+            sec_offset[level] += cur_record->dr_len;
+
+            if (cur_record->file_flags & 0x2) {
+                /* Subdirectory */
+                if (level == ISO9660_MAX_DIR_DEPTH - 1) {
+                    sclp_print("ISO-9660 directory depth limit exceeded\n");
+                } else {
+                    level++;
+                    sec_loc[level] = iso_733_to_u32(cur_record->ext_loc);
+                    sec_offset[level] = 0;
+                    dir_rem[level] = 0;
+                    continue;
+                }
+            }
+        }
+
+        if (dir_rem[level] == 0) {
+            /* Nothing remaining */
+            level--;
+            read_iso_sector(sec_loc[level], temp,
+                            "Failed to read ISO directory");
+        }
+    }
+
+    return 0;
+}
+
+static void load_iso_bc_entry(IsoBcSection *load)
+{
+    IsoBcSection s = *load;
+    /*
+     * According to spec, extent for each file
+     * is padded and ISO_SECTOR_SIZE bytes aligned
+     */
+    uint32_t blks_to_load = bswap16(s.sector_count) >> ET_SECTOR_SHIFT;
+    uint32_t real_size = iso_get_file_size(bswap32(s.load_rba));
+
+    if (real_size) {
+        /* Round up blocks to load */
+        blks_to_load = (real_size + ISO_SECTOR_SIZE - 1) / ISO_SECTOR_SIZE;
+        sclp_print("ISO boot image size verified\n");
+    } else {
+        sclp_print("ISO boot image size could not be verified\n");
+    }
+
+    read_iso_boot_image(bswap32(s.load_rba),
+                        (void *)((uint64_t)bswap16(s.load_segment)),
+                        blks_to_load);
+
+    /* Trying to get PSW at zero address */
+    if (*((uint64_t *)0) & IPL_PSW_MASK) {
+        jump_to_IPL_code((*((uint64_t *)0)) & 0x7fffffff);
+    }
+
+    /* Try default linux start address */
+    jump_to_IPL_code(KERN_IMAGE_START);
+}
+
+static uint32_t find_iso_bc(void)
+{
+    IsoVolDesc *vd = (IsoVolDesc *)sec;
+    uint32_t block_num = ISO_PRIMARY_VD_SECTOR;
+
+    if (virtio_read_many(block_num++, sec, 1)) {
+        /* If primary vd cannot be read, there is no boot catalog */
+        return 0;
+    }
+
+    while (is_iso_vd_valid(vd) && vd->type != VOL_DESC_TERMINATOR) {
+        if (vd->type == VOL_DESC_TYPE_BOOT) {
+            IsoVdElTorito *et = &vd->vd.boot;
+
+            if (!_memcmp(&et->el_torito[0], el_torito_magic, 32)) {
+                return bswap32(et->bc_offset);
+            }
+        }
+        read_iso_sector(block_num++, sec,
+                        "Failed to read ISO volume descriptor");
+    }
+
+    return 0;
+}
+
+static IsoBcSection *find_iso_bc_entry(void)
+{
+    IsoBcEntry *e = (IsoBcEntry *)sec;
+    uint32_t offset = find_iso_bc();
+    int i;
+
+    if (!offset) {
+        return NULL;
+    }
+
+    read_iso_sector(offset, sec, "Failed to read El Torito boot catalog");
+
+    if (!is_iso_bc_valid(e)) {
+        /* The validation entry is mandatory */
+        panic("No valid boot catalog found!\n");
+        return NULL;
+    }
+
+    /*
+     * Each entry has 32 bytes size, so one sector cannot contain > 64 entries.
+     * We consider only boot catalogs with no more than 64 entries.
+     */
+    for (i = 1; i < ISO_BC_ENTRY_PER_SECTOR; i++) {
+        if (e[i].id == ISO_BC_BOOTABLE_SECTION) {
+            if (is_iso_bc_entry_compatible(&e[i].body.sect)) {
+                return &e[i].body.sect;
+            }
+        }
+    }
+
+    panic("No suitable boot entry found on ISO-9660 media!\n");
+
+    return NULL;
+}
+
+static void ipl_iso_el_torito(void)
+{
+    IsoBcSection *s = find_iso_bc_entry();
+
+    if (s) {
+        load_iso_bc_entry(s);
+        /* no return */
+    }
+}
+
+/***********************************************************************
+ * Bus specific IPL sequences
+ */
+
+static void zipl_load_vblk(void)
+{
+    if (virtio_guessed_disk_nature()) {
+        virtio_assume_iso9660();
+    }
+    ipl_iso_el_torito();
+
+    if (virtio_guessed_disk_nature()) {
+        sclp_print("Using guessed DASD geometry.\n");
+        virtio_assume_eckd();
+    }
+    ipl_eckd();
+}
+
+static void zipl_load_vscsi(void)
+{
+    if (virtio_get_block_size() == VIRTIO_ISO_BLOCK_SIZE) {
+        /* Is it an ISO image in non-CD drive? */
+        ipl_iso_el_torito();
+    }
+
+    sclp_print("Using guessed DASD geometry.\n");
+    virtio_assume_eckd();
+    ipl_eckd();
+}
+
+/***********************************************************************
  * IPL starts here
  */
 
 void zipl_load(void)
 {
-    ScsiMbr *mbr = (void *)sec;
-    LDL_VTOC *vlbl = (void *)sec;
+    VDev *vdev = virtio_get_device();
 
-    /* Grab the MBR */
-    memset(sec, FREE_SPACE_FILLER, sizeof(sec));
-    read_block(0, mbr, "Cannot read block 0");
-
-    dputs("checking magic\n");
-
-    if (magic_match(mbr->magic, ZIPL_MAGIC)) {
-        ipl_scsi(); /* no return */
+    if (vdev->is_cdrom) {
+        ipl_iso_el_torito();
+        panic("\n! Cannot IPL this ISO image !\n");
     }
 
-    /* We have failed to follow the SCSI scheme, so */
-    sclp_print("Using ECKD scheme.\n");
-    if (virtio_guessed_disk_nature()) {
-        sclp_print("Using guessed DASD geometry.\n");
-        virtio_assume_eckd();
+    if (virtio_get_device_type() == VIRTIO_ID_NET) {
+        jump_to_IPL_code(vdev->netboot_start_addr);
     }
 
-    if (magic_match(mbr->magic, IPL1_MAGIC)) {
-        ipl_eckd(ECKD_CDL); /* no return */
+    ipl_scsi();
+
+    switch (virtio_get_device_type()) {
+    case VIRTIO_ID_BLOCK:
+        zipl_load_vblk();
+        break;
+    case VIRTIO_ID_SCSI:
+        zipl_load_vscsi();
+        break;
+    default:
+        panic("\n! Unknown IPL device type !\n");
     }
 
-    /* LDL/CMS? */
-    memset(sec, FREE_SPACE_FILLER, sizeof(sec));
-    read_block(2, vlbl, "Cannot read block 2");
-
-    if (magic_match(vlbl->magic, CMS1_MAGIC)) {
-        ipl_eckd(ECKD_CMS); /* no return */
-    }
-    if (magic_match(vlbl->magic, LNX1_MAGIC)) {
-        ipl_eckd(ECKD_LDL); /* no return */
-    }
-
-    virtio_panic("\n* invalid MBR magic *\n");
+    panic("\n* this can never happen *\n");
 }

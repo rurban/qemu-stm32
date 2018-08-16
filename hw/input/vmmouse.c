@@ -21,6 +21,7 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+#include "qemu/osdep.h"
 #include "hw/hw.h"
 #include "ui/console.h"
 #include "hw/input/ps2.h"
@@ -285,7 +286,7 @@ static void vmmouse_class_initfn(ObjectClass *klass, void *data)
     dc->vmsd = &vmstate_vmmouse;
     dc->props = vmmouse_properties;
     /* Reason: pointer property "ps2_mouse" */
-    dc->cannot_instantiate_with_device_add_yet = true;
+    dc->user_creatable = false;
 }
 
 static const TypeInfo vmmouse_info = {

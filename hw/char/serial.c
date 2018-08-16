@@ -23,8 +23,10 @@
  * THE SOFTWARE.
  */
 
+#include "qemu/osdep.h"
 #include "hw/char/serial.h"
 #include "sysemu/char.h"
+#include "qapi/error.h"
 #include "qemu/timer.h"
 #include "exec/address-spaces.h"
 #include "qemu/error-report.h"
@@ -104,6 +106,7 @@ do {} while (0)
 #endif
 
 static void serial_receive1(void *opaque, const uint8_t *buf, int size);
+static void serial_xmit(SerialState *s);
 
 static inline void recv_fifo_put(SerialState *s, uint8_t chr)
 {
@@ -150,8 +153,9 @@ static void serial_update_parameters(SerialState *s)
     int speed, parity, data_bits, stop_bits, frame_size;
     QEMUSerialSetParams ssp;
 
-    if (s->divider == 0)
+    if (s->divider == 0 || s->divider > s->baudbase) {
         return;
+    }
 
     /* Start bit. */
     frame_size = 1;
@@ -177,8 +181,8 @@ static void serial_update_parameters(SerialState *s)
     ssp.parity = parity;
     ssp.data_bits = data_bits;
     ssp.stop_bits = stop_bits;
-    s->char_transmit_time =  (get_ticks_per_sec() / speed) * frame_size;
-    qemu_chr_fe_ioctl(s->chr, CHR_IOCTL_SERIAL_SET_PARAMS, &ssp);
+    s->char_transmit_time =  (NANOSECONDS_PER_SECOND / speed) * frame_size;
+    qemu_chr_fe_ioctl(&s->chr, CHR_IOCTL_SERIAL_SET_PARAMS, &ssp);
 
     DPRINTF("speed=%d parity=%c data=%d stop=%d\n",
            speed, parity, data_bits, stop_bits);
@@ -191,7 +195,8 @@ static void serial_update_msl(SerialState *s)
 
     timer_del(s->modem_status_poll);
 
-    if (qemu_chr_fe_ioctl(s->chr,CHR_IOCTL_SERIAL_GET_TIOCM, &flags) == -ENOTSUP) {
+    if (qemu_chr_fe_ioctl(&s->chr, CHR_IOCTL_SERIAL_GET_TIOCM,
+                          &flags) == -ENOTSUP) {
         s->poll_msl = -1;
         return;
     }
@@ -215,62 +220,97 @@ static void serial_update_msl(SerialState *s)
     /* The real 16550A apparently has a 250ns response latency to line status changes.
        We'll be lazy and poll only every 10ms, and only poll it at all if MSI interrupts are turned on */
 
-    if (s->poll_msl)
-        timer_mod(s->modem_status_poll, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + get_ticks_per_sec() / 100);
+    if (s->poll_msl) {
+        timer_mod(s->modem_status_poll, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  NANOSECONDS_PER_SECOND / 100);
+    }
 }
 
-static gboolean serial_xmit(GIOChannel *chan, GIOCondition cond, void *opaque)
+static gboolean serial_watch_cb(GIOChannel *chan, GIOCondition cond,
+                                void *opaque)
 {
     SerialState *s = opaque;
+    s->watch_tag = 0;
+    serial_xmit(s);
+    return FALSE;
+}
 
+static void serial_xmit(SerialState *s)
+{
     do {
-        if (s->tsr_retry <= 0) {
+        assert(!(s->lsr & UART_LSR_TEMT));
+        if (s->tsr_retry == 0) {
+            assert(!(s->lsr & UART_LSR_THRE));
+
             if (s->fcr & UART_FCR_FE) {
-                if (fifo8_is_empty(&s->xmit_fifo)) {
-                    return FALSE;
-                }
+                assert(!fifo8_is_empty(&s->xmit_fifo));
                 s->tsr = fifo8_pop(&s->xmit_fifo);
                 if (!s->xmit_fifo.num) {
                     s->lsr |= UART_LSR_THRE;
                 }
-            } else if ((s->lsr & UART_LSR_THRE)) {
-                return FALSE;
             } else {
                 s->tsr = s->thr;
                 s->lsr |= UART_LSR_THRE;
-                s->lsr &= ~UART_LSR_TEMT;
+            }
+            if ((s->lsr & UART_LSR_THRE) && !s->thr_ipending) {
+                s->thr_ipending = 1;
+                serial_update_irq(s);
             }
         }
 
         if (s->mcr & UART_MCR_LOOP) {
             /* in loopback mode, say that we just received a char */
             serial_receive1(s, &s->tsr, 1);
-        } else if (qemu_chr_fe_write(s->chr, &s->tsr, 1) != 1) {
-            if (s->tsr_retry >= 0 && s->tsr_retry < MAX_XMIT_RETRY &&
-                qemu_chr_fe_add_watch(s->chr, G_IO_OUT|G_IO_HUP,
-                                      serial_xmit, s) > 0) {
+        } else if (qemu_chr_fe_write(&s->chr, &s->tsr, 1) != 1 &&
+                   s->tsr_retry < MAX_XMIT_RETRY) {
+            assert(s->watch_tag == 0);
+            s->watch_tag =
+                qemu_chr_fe_add_watch(&s->chr, G_IO_OUT | G_IO_HUP,
+                                      serial_watch_cb, s);
+            if (s->watch_tag > 0) {
                 s->tsr_retry++;
-                return FALSE;
+                return;
             }
-            s->tsr_retry = 0;
-        } else {
-            s->tsr_retry = 0;
         }
+        s->tsr_retry = 0;
+
         /* Transmit another byte if it is already available. It is only
            possible when FIFO is enabled and not empty. */
-    } while ((s->fcr & UART_FCR_FE) && !fifo8_is_empty(&s->xmit_fifo));
+    } while (!(s->lsr & UART_LSR_THRE));
 
     s->last_xmit_ts = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-
-    if (s->lsr & UART_LSR_THRE) {
-        s->lsr |= UART_LSR_TEMT;
-        s->thr_ipending = 1;
-        serial_update_irq(s);
-    }
-
-    return FALSE;
+    s->lsr |= UART_LSR_TEMT;
 }
 
+/* Setter for FCR.
+   is_load flag means, that value is set while loading VM state
+   and interrupt should not be invoked */
+static void serial_write_fcr(SerialState *s, uint8_t val)
+{
+    /* Set fcr - val only has the bits that are supposed to "stick" */
+    s->fcr = val;
+
+    if (val & UART_FCR_FE) {
+        s->iir |= UART_IIR_FE;
+        /* Set recv_fifo trigger Level */
+        switch (val & 0xC0) {
+        case UART_FCR_ITL_1:
+            s->recv_fifo_itl = 1;
+            break;
+        case UART_FCR_ITL_2:
+            s->recv_fifo_itl = 4;
+            break;
+        case UART_FCR_ITL_3:
+            s->recv_fifo_itl = 8;
+            break;
+        case UART_FCR_ITL_4:
+            s->recv_fifo_itl = 14;
+            break;
+        }
+    } else {
+        s->iir &= ~UART_IIR_FE;
+    }
+}
 
 static void serial_ioport_write(void *opaque, hwaddr addr, uint64_t val,
                                 unsigned size)
@@ -293,13 +333,13 @@ static void serial_ioport_write(void *opaque, hwaddr addr, uint64_t val,
                     fifo8_pop(&s->xmit_fifo);
                 }
                 fifo8_push(&s->xmit_fifo, s->thr);
-                s->lsr &= ~UART_LSR_TEMT;
             }
             s->thr_ipending = 0;
             s->lsr &= ~UART_LSR_THRE;
+            s->lsr &= ~UART_LSR_TEMT;
             serial_update_irq(s);
-            if (s->tsr_retry <= 0) {
-                serial_xmit(NULL, G_IO_OUT, s);
+            if (s->tsr_retry == 0) {
+                serial_xmit(s);
             }
         }
         break;
@@ -308,10 +348,12 @@ static void serial_ioport_write(void *opaque, hwaddr addr, uint64_t val,
             s->divider = (s->divider & 0x00ff) | (val << 8);
             serial_update_parameters(s);
         } else {
+            uint8_t changed = (s->ier ^ val) & 0x0f;
             s->ier = val & 0x0f;
             /* If the backend device is a real serial port, turn polling of the modem
-               status lines on physical port on or off depending on UART_IER_MSI state */
-            if (s->poll_msl >= 0) {
+             * status lines on physical port on or off depending on UART_IER_MSI state.
+             */
+            if ((changed & UART_IER_MSI) && s->poll_msl >= 0) {
                 if (s->ier & UART_IER_MSI) {
                      s->poll_msl = 1;
                      serial_update_msl(s);
@@ -320,56 +362,53 @@ static void serial_ioport_write(void *opaque, hwaddr addr, uint64_t val,
                      s->poll_msl = 0;
                 }
             }
-            if (s->lsr & UART_LSR_THRE) {
-                s->thr_ipending = 1;
+
+            /* Turning on the THRE interrupt on IER can trigger the interrupt
+             * if LSR.THRE=1, even if it had been masked before by reading IIR.
+             * This is not in the datasheet, but Windows relies on it.  It is
+             * unclear if THRE has to be resampled every time THRI becomes
+             * 1, or only on the rising edge.  Bochs does the latter, and Windows
+             * always toggles IER to all zeroes and back to all ones, so do the
+             * same.
+             *
+             * If IER.THRI is zero, thr_ipending is not used.  Set it to zero
+             * so that the thr_ipending subsection is not migrated.
+             */
+            if (changed & UART_IER_THRI) {
+                if ((s->ier & UART_IER_THRI) && (s->lsr & UART_LSR_THRE)) {
+                    s->thr_ipending = 1;
+                } else {
+                    s->thr_ipending = 0;
+                }
+            }
+
+            if (changed) {
                 serial_update_irq(s);
             }
         }
         break;
     case 2:
-        val = val & 0xFF;
-
-        if (s->fcr == val)
-            break;
-
         /* Did the enable/disable flag change? If so, make sure FIFOs get flushed */
-        if ((val ^ s->fcr) & UART_FCR_FE)
+        if ((val ^ s->fcr) & UART_FCR_FE) {
             val |= UART_FCR_XFR | UART_FCR_RFR;
+        }
 
         /* FIFO clear */
 
         if (val & UART_FCR_RFR) {
+            s->lsr &= ~(UART_LSR_DR | UART_LSR_BI);
             timer_del(s->fifo_timeout_timer);
-            s->timeout_ipending=0;
+            s->timeout_ipending = 0;
             fifo8_reset(&s->recv_fifo);
         }
 
         if (val & UART_FCR_XFR) {
+            s->lsr |= UART_LSR_THRE;
+            s->thr_ipending = 1;
             fifo8_reset(&s->xmit_fifo);
         }
 
-        if (val & UART_FCR_FE) {
-            s->iir |= UART_IIR_FE;
-            /* Set recv_fifo trigger Level */
-            switch (val & 0xC0) {
-            case UART_FCR_ITL_1:
-                s->recv_fifo_itl = 1;
-                break;
-            case UART_FCR_ITL_2:
-                s->recv_fifo_itl = 4;
-                break;
-            case UART_FCR_ITL_3:
-                s->recv_fifo_itl = 8;
-                break;
-            case UART_FCR_ITL_4:
-                s->recv_fifo_itl = 14;
-                break;
-            }
-        } else
-            s->iir &= ~UART_IIR_FE;
-
-        /* Set fcr - or at least the bits in it that are supposed to "stick" */
-        s->fcr = val & 0xC9;
+        serial_write_fcr(s, val & 0xC9);
         serial_update_irq(s);
         break;
     case 3:
@@ -380,8 +419,8 @@ static void serial_ioport_write(void *opaque, hwaddr addr, uint64_t val,
             break_enable = (val >> 6) & 1;
             if (break_enable != s->last_break_enable) {
                 s->last_break_enable = break_enable;
-                qemu_chr_fe_ioctl(s->chr, CHR_IOCTL_SERIAL_SET_BREAK,
-                               &break_enable);
+                qemu_chr_fe_ioctl(&s->chr, CHR_IOCTL_SERIAL_SET_BREAK,
+                                  &break_enable);
             }
         }
         break;
@@ -395,7 +434,7 @@ static void serial_ioport_write(void *opaque, hwaddr addr, uint64_t val,
 
             if (s->poll_msl >= 0 && old_mcr != s->mcr) {
 
-                qemu_chr_fe_ioctl(s->chr,CHR_IOCTL_SERIAL_GET_TIOCM, &flags);
+                qemu_chr_fe_ioctl(&s->chr, CHR_IOCTL_SERIAL_GET_TIOCM, &flags);
 
                 flags &= ~(CHR_TIOCM_RTS | CHR_TIOCM_DTR);
 
@@ -404,7 +443,7 @@ static void serial_ioport_write(void *opaque, hwaddr addr, uint64_t val,
                 if (val & UART_MCR_DTR)
                     flags |= CHR_TIOCM_DTR;
 
-                qemu_chr_fe_ioctl(s->chr,CHR_IOCTL_SERIAL_SET_TIOCM, &flags);
+                qemu_chr_fe_ioctl(&s->chr, CHR_IOCTL_SERIAL_SET_TIOCM, &flags);
                 /* Update the modem status after a one-character-send wait-time, since there may be a response
                    from the device/computer at the other end of the serial line */
                 timer_mod(s->modem_status_poll, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->char_transmit_time);
@@ -449,7 +488,7 @@ static uint64_t serial_ioport_read(void *opaque, hwaddr addr, unsigned size)
             serial_update_irq(s);
             if (!(s->mcr & UART_MCR_LOOP)) {
                 /* in loopback mode, don't receive any data */
-                qemu_chr_accept_input(s->chr);
+                qemu_chr_fe_accept_input(&s->chr);
             }
         }
         break;
@@ -590,6 +629,14 @@ static void serial_pre_save(void *opaque)
     s->fcr_vmstate = s->fcr;
 }
 
+static int serial_pre_load(void *opaque)
+{
+    SerialState *s = opaque;
+    s->thr_ipending = -1;
+    s->poll_msl = -1;
+    return 0;
+}
+
 static int serial_post_load(void *opaque, int version_id)
 {
     SerialState *s = opaque;
@@ -597,17 +644,180 @@ static int serial_post_load(void *opaque, int version_id)
     if (version_id < 3) {
         s->fcr_vmstate = 0;
     }
+    if (s->thr_ipending == -1) {
+        s->thr_ipending = ((s->iir & UART_IIR_ID) == UART_IIR_THRI);
+    }
+
+    if (s->tsr_retry > 0) {
+        /* tsr_retry > 0 implies LSR.TEMT = 0 (transmitter not empty).  */
+        if (s->lsr & UART_LSR_TEMT) {
+            error_report("inconsistent state in serial device "
+                         "(tsr empty, tsr_retry=%d", s->tsr_retry);
+            return -1;
+        }
+
+        if (s->tsr_retry > MAX_XMIT_RETRY) {
+            s->tsr_retry = MAX_XMIT_RETRY;
+        }
+
+        assert(s->watch_tag == 0);
+        s->watch_tag = qemu_chr_fe_add_watch(&s->chr, G_IO_OUT | G_IO_HUP,
+                                             serial_watch_cb, s);
+    } else {
+        /* tsr_retry == 0 implies LSR.TEMT = 1 (transmitter empty).  */
+        if (!(s->lsr & UART_LSR_TEMT)) {
+            error_report("inconsistent state in serial device "
+                         "(tsr not empty, tsr_retry=0");
+            return -1;
+        }
+    }
+
+    s->last_break_enable = (s->lcr >> 6) & 1;
     /* Initialize fcr via setter to perform essential side-effects */
-    serial_ioport_write(s, 0x02, s->fcr_vmstate, 1);
+    serial_write_fcr(s, s->fcr_vmstate);
     serial_update_parameters(s);
     return 0;
 }
+
+static bool serial_thr_ipending_needed(void *opaque)
+{
+    SerialState *s = opaque;
+
+    if (s->ier & UART_IER_THRI) {
+        bool expected_value = ((s->iir & UART_IIR_ID) == UART_IIR_THRI);
+        return s->thr_ipending != expected_value;
+    } else {
+        /* LSR.THRE will be sampled again when the interrupt is
+         * enabled.  thr_ipending is not used in this case, do
+         * not migrate it.
+         */
+        return false;
+    }
+}
+
+static const VMStateDescription vmstate_serial_thr_ipending = {
+    .name = "serial/thr_ipending",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = serial_thr_ipending_needed,
+    .fields = (VMStateField[]) {
+        VMSTATE_INT32(thr_ipending, SerialState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static bool serial_tsr_needed(void *opaque)
+{
+    SerialState *s = (SerialState *)opaque;
+    return s->tsr_retry != 0;
+}
+
+static const VMStateDescription vmstate_serial_tsr = {
+    .name = "serial/tsr",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = serial_tsr_needed,
+    .fields = (VMStateField[]) {
+        VMSTATE_UINT32(tsr_retry, SerialState),
+        VMSTATE_UINT8(thr, SerialState),
+        VMSTATE_UINT8(tsr, SerialState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static bool serial_recv_fifo_needed(void *opaque)
+{
+    SerialState *s = (SerialState *)opaque;
+    return !fifo8_is_empty(&s->recv_fifo);
+
+}
+
+static const VMStateDescription vmstate_serial_recv_fifo = {
+    .name = "serial/recv_fifo",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = serial_recv_fifo_needed,
+    .fields = (VMStateField[]) {
+        VMSTATE_STRUCT(recv_fifo, SerialState, 1, vmstate_fifo8, Fifo8),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static bool serial_xmit_fifo_needed(void *opaque)
+{
+    SerialState *s = (SerialState *)opaque;
+    return !fifo8_is_empty(&s->xmit_fifo);
+}
+
+static const VMStateDescription vmstate_serial_xmit_fifo = {
+    .name = "serial/xmit_fifo",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = serial_xmit_fifo_needed,
+    .fields = (VMStateField[]) {
+        VMSTATE_STRUCT(xmit_fifo, SerialState, 1, vmstate_fifo8, Fifo8),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static bool serial_fifo_timeout_timer_needed(void *opaque)
+{
+    SerialState *s = (SerialState *)opaque;
+    return timer_pending(s->fifo_timeout_timer);
+}
+
+static const VMStateDescription vmstate_serial_fifo_timeout_timer = {
+    .name = "serial/fifo_timeout_timer",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = serial_fifo_timeout_timer_needed,
+    .fields = (VMStateField[]) {
+        VMSTATE_TIMER_PTR(fifo_timeout_timer, SerialState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static bool serial_timeout_ipending_needed(void *opaque)
+{
+    SerialState *s = (SerialState *)opaque;
+    return s->timeout_ipending != 0;
+}
+
+static const VMStateDescription vmstate_serial_timeout_ipending = {
+    .name = "serial/timeout_ipending",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = serial_timeout_ipending_needed,
+    .fields = (VMStateField[]) {
+        VMSTATE_INT32(timeout_ipending, SerialState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static bool serial_poll_needed(void *opaque)
+{
+    SerialState *s = (SerialState *)opaque;
+    return s->poll_msl >= 0;
+}
+
+static const VMStateDescription vmstate_serial_poll = {
+    .name = "serial/poll",
+    .version_id = 1,
+    .needed = serial_poll_needed,
+    .minimum_version_id = 1,
+    .fields = (VMStateField[]) {
+        VMSTATE_INT32(poll_msl, SerialState),
+        VMSTATE_TIMER_PTR(modem_status_poll, SerialState),
+        VMSTATE_END_OF_LIST()
+    }
+};
 
 const VMStateDescription vmstate_serial = {
     .name = "serial",
     .version_id = 3,
     .minimum_version_id = 2,
     .pre_save = serial_pre_save,
+    .pre_load = serial_pre_load,
     .post_load = serial_post_load,
     .fields = (VMStateField[]) {
         VMSTATE_UINT16_V(divider, SerialState, 2),
@@ -621,12 +831,27 @@ const VMStateDescription vmstate_serial = {
         VMSTATE_UINT8(scr, SerialState),
         VMSTATE_UINT8_V(fcr_vmstate, SerialState, 3),
         VMSTATE_END_OF_LIST()
+    },
+    .subsections = (const VMStateDescription*[]) {
+        &vmstate_serial_thr_ipending,
+        &vmstate_serial_tsr,
+        &vmstate_serial_recv_fifo,
+        &vmstate_serial_xmit_fifo,
+        &vmstate_serial_fifo_timeout_timer,
+        &vmstate_serial_timeout_ipending,
+        &vmstate_serial_poll,
+        NULL
     }
 };
 
 static void serial_reset(void *opaque)
 {
     SerialState *s = opaque;
+
+    if (s->watch_tag > 0) {
+        g_source_remove(s->watch_tag);
+        s->watch_tag = 0;
+    }
 
     s->rbr = 0;
     s->ier = 0;
@@ -639,8 +864,12 @@ static void serial_reset(void *opaque)
     s->mcr = UART_MCR_OUT2;
     s->scr = 0;
     s->tsr_retry = 0;
-    s->char_transmit_time = (get_ticks_per_sec() / 9600) * 10;
+    s->char_transmit_time = (NANOSECONDS_PER_SECOND / 9600) * 10;
     s->poll_msl = 0;
+
+    s->timeout_ipending = 0;
+    timer_del(s->fifo_timeout_timer);
+    timer_del(s->modem_status_poll);
 
     fifo8_reset(&s->recv_fifo);
     fifo8_reset(&s->xmit_fifo);
@@ -650,11 +879,14 @@ static void serial_reset(void *opaque)
     s->thr_ipending = 0;
     s->last_break_enable = 0;
     qemu_irq_lower(s->irq);
+
+    serial_update_msl(s);
+    s->msr &= ~UART_MSR_ANY_DELTA;
 }
 
 void serial_realize_core(SerialState *s, Error **errp)
 {
-    if (!s->chr) {
+    if (!qemu_chr_fe_get_driver(&s->chr)) {
         error_setg(errp, "Can't create serial device, empty char device");
         return;
     }
@@ -664,15 +896,26 @@ void serial_realize_core(SerialState *s, Error **errp)
     s->fifo_timeout_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, (QEMUTimerCB *) fifo_timeout_int, s);
     qemu_register_reset(serial_reset, s);
 
-    qemu_chr_add_handlers(s->chr, serial_can_receive1, serial_receive1,
-                          serial_event, s);
+    qemu_chr_fe_set_handlers(&s->chr, serial_can_receive1, serial_receive1,
+                             serial_event, s, NULL, true);
     fifo8_create(&s->recv_fifo, UART_FIFO_LENGTH);
     fifo8_create(&s->xmit_fifo, UART_FIFO_LENGTH);
+    serial_reset(s);
 }
 
 void serial_exit_core(SerialState *s)
 {
-    qemu_chr_add_handlers(s->chr, NULL, NULL, NULL, NULL);
+    qemu_chr_fe_deinit(&s->chr);
+
+    timer_del(s->modem_status_poll);
+    timer_free(s->modem_status_poll);
+
+    timer_del(s->fifo_timeout_timer);
+    timer_free(s->fifo_timeout_timer);
+
+    fifo8_destroy(&s->recv_fifo);
+    fifo8_destroy(&s->xmit_fifo);
+
     qemu_unregister_reset(serial_reset, s);
 }
 
@@ -694,22 +937,16 @@ const MemoryRegionOps serial_io_ops = {
 };
 
 SerialState *serial_init(int base, qemu_irq irq, int baudbase,
-                         CharDriverState *chr, MemoryRegion *system_io)
+                         Chardev *chr, MemoryRegion *system_io)
 {
     SerialState *s;
-    Error *err = NULL;
 
     s = g_malloc0(sizeof(SerialState));
 
     s->irq = irq;
     s->baudbase = baudbase;
-    s->chr = chr;
-    serial_realize_core(s, &err);
-    if (err != NULL) {
-        error_report("%s", error_get_pretty(err));
-        error_free(err);
-        exit(1);
-    }
+    qemu_chr_fe_init(&s->chr, chr, &error_abort);
+    serial_realize_core(s, &error_fatal);
 
     vmstate_register(NULL, base, &vmstate_serial, s);
 
@@ -756,30 +993,22 @@ static const MemoryRegionOps serial_mm_ops[3] = {
 SerialState *serial_mm_init(MemoryRegion *address_space,
                             hwaddr base, int it_shift,
                             qemu_irq irq, int baudbase,
-                            CharDriverState *chr, enum device_endian end)
+                            Chardev *chr, enum device_endian end)
 {
     SerialState *s;
-    Error *err = NULL;
 
     s = g_malloc0(sizeof(SerialState));
 
     s->it_shift = it_shift;
     s->irq = irq;
     s->baudbase = baudbase;
-    s->chr = chr;
+    qemu_chr_fe_init(&s->chr, chr, &error_abort);
 
-    serial_realize_core(s, &err);
-    if (err != NULL) {
-        error_report("%s", error_get_pretty(err));
-        error_free(err);
-        exit(1);
-    }
+    serial_realize_core(s, &error_fatal);
     vmstate_register(NULL, base, &vmstate_serial, s);
 
     memory_region_init_io(&s->io, NULL, &serial_mm_ops[end], s,
                           "serial", 8 << it_shift);
     memory_region_add_subregion(address_space, base, &s->io);
-
-    serial_update_msl(s);
     return s;
 }

@@ -34,11 +34,12 @@
  *  Not sure which messages trigger this.
  */
 
+#include "qemu/osdep.h"
+#include "qapi/error.h"
 #include "qemu-common.h"
 #include "qemu/error-report.h"
 #include "hw/usb.h"
 #include "hw/usb/desc.h"
-#include "monitor/monitor.h"
 
 #include "ccid.h"
 
@@ -55,7 +56,7 @@ do { \
 #define D_VERBOSE 4
 
 #define CCID_DEV_NAME "usb-ccid"
-
+#define USB_CCID_DEV(obj) OBJECT_CHECK(USBCCIDState, (obj), CCID_DEV_NAME)
 /*
  * The two options for variable sized buffers:
  * make them constant size, for large enough constant,
@@ -284,6 +285,7 @@ typedef struct CCIDBus {
 typedef struct USBCCIDState {
     USBDevice dev;
     USBEndpoint *intr;
+    USBEndpoint *bulk;
     CCIDBus bus;
     CCIDCardState *card;
     BulkIn bulk_in_pending[BULK_IN_PENDING_NUM]; /* circular */
@@ -506,14 +508,14 @@ static void ccid_card_apdu_from_guest(CCIDCardState *card,
     }
 }
 
-static int ccid_card_exitfn(CCIDCardState *card)
+static void ccid_card_exitfn(CCIDCardState *card)
 {
     CCIDCardClass *cc = CCID_CARD_GET_CLASS(card);
 
     if (cc->exitfn) {
-        return cc->exitfn(card);
+        cc->exitfn(card);
     }
-    return 0;
+
 }
 
 static int ccid_card_initfn(CCIDCardState *card)
@@ -649,7 +651,7 @@ static void ccid_detach(USBCCIDState *s)
 
 static void ccid_handle_reset(USBDevice *dev)
 {
-    USBCCIDState *s = DO_UPCAST(USBCCIDState, dev, dev);
+    USBCCIDState *s = USB_CCID_DEV(dev);
 
     DPRINTF(s, 1, "Reset\n");
 
@@ -692,7 +694,7 @@ static const char *ccid_control_to_str(USBCCIDState *s, int request)
 static void ccid_handle_control(USBDevice *dev, USBPacket *p, int request,
                                int value, int index, int length, uint8_t *data)
 {
-    USBCCIDState *s = DO_UPCAST(USBCCIDState, dev, dev);
+    USBCCIDState *s = USB_CCID_DEV(dev);
     int ret;
 
     DPRINTF(s, 1, "%s: got control %s (%x), value %x\n", __func__,
@@ -770,6 +772,7 @@ static void ccid_write_slot_status(USBCCIDState *s, CCID_Header *recv)
     h->b.bError = s->bError;
     h->bClockStatus = CLOCK_STATUS_RUNNING;
     ccid_reset_error_status(s);
+    usb_wakeup(s->bulk, 0);
 }
 
 static void ccid_write_parameters(USBCCIDState *s, CCID_Header *recv)
@@ -790,6 +793,7 @@ static void ccid_write_parameters(USBCCIDState *s, CCID_Header *recv)
     h->bProtocolNum = s->bProtocolNum;
     h->abProtocolDataStructure = s->abProtocolDataStructure;
     ccid_reset_error_status(s);
+    usb_wakeup(s->bulk, 0);
 }
 
 static void ccid_write_data_block(USBCCIDState *s, uint8_t slot, uint8_t seq,
@@ -811,6 +815,7 @@ static void ccid_write_data_block(USBCCIDState *s, uint8_t slot, uint8_t seq,
     }
     memcpy(p->abData, data, len);
     ccid_reset_error_status(s);
+    usb_wakeup(s->bulk, 0);
 }
 
 static void ccid_report_error_failed(USBCCIDState *s, uint8_t error)
@@ -962,7 +967,7 @@ static void ccid_on_apdu_from_guest(USBCCIDState *s, CCID_XferBlock *recv)
     DPRINTF(s, 1, "%s: seq %d, len %d\n", __func__,
                 recv->hdr.bSeq, len);
     ccid_add_pending_answer(s, (CCID_Header *)recv);
-    if (s->card) {
+    if (s->card && len <= BULK_OUT_DATA_SIZE) {
         ccid_card_apdu_from_guest(s->card, recv->abData, len);
     } else {
         DPRINTF(s, D_WARN, "warning: discarded apdu\n");
@@ -996,80 +1001,92 @@ static void ccid_handle_bulk_out(USBCCIDState *s, USBPacket *p)
     CCID_Header *ccid_header;
 
     if (p->iov.size + s->bulk_out_pos > BULK_OUT_DATA_SIZE) {
-        p->status = USB_RET_STALL;
-        return;
+        goto err;
     }
-    ccid_header = (CCID_Header *)s->bulk_out_data;
     usb_packet_copy(p, s->bulk_out_data + s->bulk_out_pos, p->iov.size);
     s->bulk_out_pos += p->iov.size;
-    if (p->iov.size == CCID_MAX_PACKET_SIZE) {
+    if (s->bulk_out_pos < 10) {
+        DPRINTF(s, 1, "%s: header incomplete\n", __func__);
+        goto err;
+    }
+
+    ccid_header = (CCID_Header *)s->bulk_out_data;
+    if ((s->bulk_out_pos - 10 < ccid_header->dwLength) &&
+        (p->iov.size == CCID_MAX_PACKET_SIZE)) {
         DPRINTF(s, D_VERBOSE,
-            "usb-ccid: bulk_in: expecting more packets (%zd/%d)\n",
-            p->iov.size, ccid_header->dwLength);
+                "usb-ccid: bulk_in: expecting more packets (%d/%d)\n",
+                s->bulk_out_pos - 10, ccid_header->dwLength);
         return;
     }
-    if (s->bulk_out_pos < 10) {
+    if (s->bulk_out_pos - 10 != ccid_header->dwLength) {
         DPRINTF(s, 1,
-                "%s: bad USB_TOKEN_OUT length, should be at least 10 bytes\n",
-                __func__);
-    } else {
-        DPRINTF(s, D_MORE_INFO, "%s %x %s\n", __func__,
-                ccid_header->bMessageType,
-                ccid_message_type_to_str(ccid_header->bMessageType));
-        switch (ccid_header->bMessageType) {
-        case CCID_MESSAGE_TYPE_PC_to_RDR_GetSlotStatus:
-            ccid_write_slot_status(s, ccid_header);
-            break;
-        case CCID_MESSAGE_TYPE_PC_to_RDR_IccPowerOn:
-            DPRINTF(s, 1, "%s: PowerOn: %d\n", __func__,
+                "usb-ccid: bulk_in: message size mismatch (got %d, expected %d)\n",
+                s->bulk_out_pos - 10, ccid_header->dwLength);
+        goto err;
+    }
+
+    DPRINTF(s, D_MORE_INFO, "%s %x %s\n", __func__,
+            ccid_header->bMessageType,
+            ccid_message_type_to_str(ccid_header->bMessageType));
+    switch (ccid_header->bMessageType) {
+    case CCID_MESSAGE_TYPE_PC_to_RDR_GetSlotStatus:
+        ccid_write_slot_status(s, ccid_header);
+        break;
+    case CCID_MESSAGE_TYPE_PC_to_RDR_IccPowerOn:
+        DPRINTF(s, 1, "%s: PowerOn: %d\n", __func__,
                 ((CCID_IccPowerOn *)(ccid_header))->bPowerSelect);
-            s->powered = true;
-            if (!ccid_card_inserted(s)) {
-                ccid_report_error_failed(s, ERROR_ICC_MUTE);
-            }
-            /* atr is written regardless of error. */
-            ccid_write_data_block_atr(s, ccid_header);
-            break;
-        case CCID_MESSAGE_TYPE_PC_to_RDR_IccPowerOff:
-            ccid_reset_error_status(s);
-            s->powered = false;
-            ccid_write_slot_status(s, ccid_header);
-            break;
-        case CCID_MESSAGE_TYPE_PC_to_RDR_XfrBlock:
-            ccid_on_apdu_from_guest(s, (CCID_XferBlock *)s->bulk_out_data);
-            break;
-        case CCID_MESSAGE_TYPE_PC_to_RDR_SetParameters:
-            ccid_reset_error_status(s);
-            ccid_set_parameters(s, ccid_header);
-            ccid_write_parameters(s, ccid_header);
-            break;
-        case CCID_MESSAGE_TYPE_PC_to_RDR_ResetParameters:
-            ccid_reset_error_status(s);
-            ccid_reset_parameters(s);
-            ccid_write_parameters(s, ccid_header);
-            break;
-        case CCID_MESSAGE_TYPE_PC_to_RDR_GetParameters:
-            ccid_reset_error_status(s);
-            ccid_write_parameters(s, ccid_header);
-            break;
-        case CCID_MESSAGE_TYPE_PC_to_RDR_Mechanical:
-            ccid_report_error_failed(s, 0);
-            ccid_write_slot_status(s, ccid_header);
-            break;
-        default:
-            DPRINTF(s, 1,
+        s->powered = true;
+        if (!ccid_card_inserted(s)) {
+            ccid_report_error_failed(s, ERROR_ICC_MUTE);
+        }
+        /* atr is written regardless of error. */
+        ccid_write_data_block_atr(s, ccid_header);
+        break;
+    case CCID_MESSAGE_TYPE_PC_to_RDR_IccPowerOff:
+        ccid_reset_error_status(s);
+        s->powered = false;
+        ccid_write_slot_status(s, ccid_header);
+        break;
+    case CCID_MESSAGE_TYPE_PC_to_RDR_XfrBlock:
+        ccid_on_apdu_from_guest(s, (CCID_XferBlock *)s->bulk_out_data);
+        break;
+    case CCID_MESSAGE_TYPE_PC_to_RDR_SetParameters:
+        ccid_reset_error_status(s);
+        ccid_set_parameters(s, ccid_header);
+        ccid_write_parameters(s, ccid_header);
+        break;
+    case CCID_MESSAGE_TYPE_PC_to_RDR_ResetParameters:
+        ccid_reset_error_status(s);
+        ccid_reset_parameters(s);
+        ccid_write_parameters(s, ccid_header);
+        break;
+    case CCID_MESSAGE_TYPE_PC_to_RDR_GetParameters:
+        ccid_reset_error_status(s);
+        ccid_write_parameters(s, ccid_header);
+        break;
+    case CCID_MESSAGE_TYPE_PC_to_RDR_Mechanical:
+        ccid_report_error_failed(s, 0);
+        ccid_write_slot_status(s, ccid_header);
+        break;
+    default:
+        DPRINTF(s, 1,
                 "handle_data: ERROR: unhandled message type %Xh\n",
                 ccid_header->bMessageType);
-            /*
-             * The caller is expecting the device to respond, tell it we
-             * don't support the operation.
-             */
-            ccid_report_error_failed(s, ERROR_CMD_NOT_SUPPORTED);
-            ccid_write_slot_status(s, ccid_header);
-            break;
-        }
+        /*
+         * The caller is expecting the device to respond, tell it we
+         * don't support the operation.
+         */
+        ccid_report_error_failed(s, ERROR_CMD_NOT_SUPPORTED);
+        ccid_write_slot_status(s, ccid_header);
+        break;
     }
     s->bulk_out_pos = 0;
+    return;
+
+err:
+    p->status = USB_RET_STALL;
+    s->bulk_out_pos = 0;
+    return;
 }
 
 static void ccid_bulk_in_copy_to_guest(USBCCIDState *s, USBPacket *p)
@@ -1104,7 +1121,7 @@ static void ccid_bulk_in_copy_to_guest(USBCCIDState *s, USBPacket *p)
 
 static void ccid_handle_data(USBDevice *dev, USBPacket *p)
 {
-    USBCCIDState *s = DO_UPCAST(USBCCIDState, dev, dev);
+    USBCCIDState *s = USB_CCID_DEV(dev);
     uint8_t buf[2];
 
     switch (p->pid) {
@@ -1146,9 +1163,9 @@ static void ccid_handle_data(USBDevice *dev, USBPacket *p)
     }
 }
 
-static void ccid_handle_destroy(USBDevice *dev)
+static void ccid_unrealize(USBDevice *dev, Error **errp)
 {
-    USBCCIDState *s = DO_UPCAST(USBCCIDState, dev, dev);
+    USBCCIDState *s = USB_CCID_DEV(dev);
 
     ccid_bulk_in_clear(s);
 }
@@ -1184,8 +1201,9 @@ static const TypeInfo ccid_bus_info = {
 void ccid_card_send_apdu_to_guest(CCIDCardState *card,
                                   uint8_t *apdu, uint32_t len)
 {
-    USBCCIDState *s = DO_UPCAST(USBCCIDState, dev.qdev,
-                                card->qdev.parent_bus->parent);
+    DeviceState *qdev = DEVICE(card);
+    USBDevice *dev = USB_DEVICE(qdev->parent_bus->parent);
+    USBCCIDState *s = USB_CCID_DEV(dev);
     Answer *answer;
 
     if (!ccid_has_pending_answers(s)) {
@@ -1206,8 +1224,9 @@ void ccid_card_send_apdu_to_guest(CCIDCardState *card,
 
 void ccid_card_card_removed(CCIDCardState *card)
 {
-    USBCCIDState *s =
-        DO_UPCAST(USBCCIDState, dev.qdev, card->qdev.parent_bus->parent);
+    DeviceState *qdev = DEVICE(card);
+    USBDevice *dev = USB_DEVICE(qdev->parent_bus->parent);
+    USBCCIDState *s = USB_CCID_DEV(dev);
 
     ccid_on_slot_change(s, false);
     ccid_flush_pending_answers(s);
@@ -1216,8 +1235,9 @@ void ccid_card_card_removed(CCIDCardState *card)
 
 int ccid_card_ccid_attach(CCIDCardState *card)
 {
-    USBCCIDState *s =
-        DO_UPCAST(USBCCIDState, dev.qdev, card->qdev.parent_bus->parent);
+    DeviceState *qdev = DEVICE(card);
+    USBDevice *dev = USB_DEVICE(qdev->parent_bus->parent);
+    USBCCIDState *s = USB_CCID_DEV(dev);
 
     DPRINTF(s, 1, "CCID Attach\n");
     if (s->migration_state == MIGRATION_MIGRATED) {
@@ -1228,8 +1248,9 @@ int ccid_card_ccid_attach(CCIDCardState *card)
 
 void ccid_card_ccid_detach(CCIDCardState *card)
 {
-    USBCCIDState *s =
-        DO_UPCAST(USBCCIDState, dev.qdev, card->qdev.parent_bus->parent);
+    DeviceState *qdev = DEVICE(card);
+    USBDevice *dev = USB_DEVICE(qdev->parent_bus->parent);
+    USBCCIDState *s = USB_CCID_DEV(dev);
 
     DPRINTF(s, 1, "CCID Detach\n");
     if (ccid_card_inserted(s)) {
@@ -1240,8 +1261,9 @@ void ccid_card_ccid_detach(CCIDCardState *card)
 
 void ccid_card_card_error(CCIDCardState *card, uint64_t error)
 {
-    USBCCIDState *s =
-        DO_UPCAST(USBCCIDState, dev.qdev, card->qdev.parent_bus->parent);
+    DeviceState *qdev = DEVICE(card);
+    USBDevice *dev = USB_DEVICE(qdev->parent_bus->parent);
+    USBCCIDState *s = USB_CCID_DEV(dev);
 
     s->bmCommandStatus = COMMAND_STATUS_FAILED;
     s->last_answer_error = error;
@@ -1258,8 +1280,9 @@ void ccid_card_card_error(CCIDCardState *card, uint64_t error)
 
 void ccid_card_card_inserted(CCIDCardState *card)
 {
-    USBCCIDState *s =
-        DO_UPCAST(USBCCIDState, dev.qdev, card->qdev.parent_bus->parent);
+    DeviceState *qdev = DEVICE(card);
+    USBDevice *dev = USB_DEVICE(qdev->parent_bus->parent);
+    USBCCIDState *s = USB_CCID_DEV(dev);
 
     s->bmCommandStatus = COMMAND_STATUS_NO_ERROR;
     ccid_flush_pending_answers(s);
@@ -1268,24 +1291,23 @@ void ccid_card_card_inserted(CCIDCardState *card)
 
 static int ccid_card_exit(DeviceState *qdev)
 {
-    int ret = 0;
     CCIDCardState *card = CCID_CARD(qdev);
-    USBCCIDState *s =
-        DO_UPCAST(USBCCIDState, dev.qdev, card->qdev.parent_bus->parent);
+    USBDevice *dev = USB_DEVICE(qdev->parent_bus->parent);
+    USBCCIDState *s = USB_CCID_DEV(dev);
 
     if (ccid_card_inserted(s)) {
         ccid_card_card_removed(card);
     }
-    ret = ccid_card_exitfn(card);
+    ccid_card_exitfn(card);
     s->card = NULL;
-    return ret;
+    return 0;
 }
 
 static int ccid_card_init(DeviceState *qdev)
 {
     CCIDCardState *card = CCID_CARD(qdev);
-    USBCCIDState *s =
-        DO_UPCAST(USBCCIDState, dev.qdev, card->qdev.parent_bus->parent);
+    USBDevice *dev = USB_DEVICE(qdev->parent_bus->parent);
+    USBCCIDState *s = USB_CCID_DEV(dev);
     int ret = 0;
 
     if (card->slot != 0) {
@@ -1304,16 +1326,17 @@ static int ccid_card_init(DeviceState *qdev)
     return ret;
 }
 
-static int ccid_initfn(USBDevice *dev)
+static void ccid_realize(USBDevice *dev, Error **errp)
 {
-    USBCCIDState *s = DO_UPCAST(USBCCIDState, dev, dev);
+    USBCCIDState *s = USB_CCID_DEV(dev);
 
     usb_desc_create_serial(dev);
     usb_desc_init(dev);
     qbus_create_inplace(&s->bus, sizeof(s->bus), TYPE_CCID_BUS, DEVICE(dev),
                         NULL);
+    qbus_set_hotplug_handler(BUS(&s->bus), DEVICE(dev), &error_abort);
     s->intr = usb_ep_get(dev, USB_TOKEN_IN, CCID_INT_IN_EP);
-    s->bus.qbus.allow_hotplug = 1;
+    s->bulk = usb_ep_get(dev, USB_TOKEN_IN, CCID_BULK_IN_EP);
     s->card = NULL;
     s->migration_state = MIGRATION_NONE;
     s->migration_target_ip = 0;
@@ -1332,7 +1355,6 @@ static int ccid_initfn(USBDevice *dev)
     ccid_reset_parameters(s);
     ccid_reset(s);
     s->debug = parse_debug_env("QEMU_CCID_DEBUG", D_VERBOSE, s->debug);
-    return 0;
 }
 
 static int ccid_post_load(void *opaque, int version_id)
@@ -1440,18 +1462,20 @@ static void ccid_class_initfn(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     USBDeviceClass *uc = USB_DEVICE_CLASS(klass);
+    HotplugHandlerClass *hc = HOTPLUG_HANDLER_CLASS(klass);
 
-    uc->init           = ccid_initfn;
+    uc->realize        = ccid_realize;
     uc->product_desc   = "QEMU USB CCID";
     uc->usb_desc       = &desc_ccid;
     uc->handle_reset   = ccid_handle_reset;
     uc->handle_control = ccid_handle_control;
     uc->handle_data    = ccid_handle_data;
-    uc->handle_destroy = ccid_handle_destroy;
+    uc->unrealize      = ccid_unrealize;
     dc->desc = "CCID Rev 1.1 smartcard reader";
     dc->vmsd = &ccid_vmstate;
     dc->props = ccid_properties;
     set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
+    hc->unplug = qdev_simple_device_unplug_cb;
 }
 
 static const TypeInfo ccid_info = {
@@ -1459,6 +1483,10 @@ static const TypeInfo ccid_info = {
     .parent        = TYPE_USB_DEVICE,
     .instance_size = sizeof(USBCCIDState),
     .class_init    = ccid_class_initfn,
+    .interfaces = (InterfaceInfo[]) {
+        { TYPE_HOTPLUG_HANDLER },
+        { }
+    }
 };
 
 static void ccid_card_class_init(ObjectClass *klass, void *data)

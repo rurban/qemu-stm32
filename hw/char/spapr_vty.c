@@ -1,3 +1,8 @@
+#include "qemu/osdep.h"
+#include "qemu/error-report.h"
+#include "qapi/error.h"
+#include "qemu-common.h"
+#include "cpu.h"
 #include "hw/qdev.h"
 #include "sysemu/char.h"
 #include "hw/ppc/spapr.h"
@@ -7,7 +12,7 @@
 
 typedef struct VIOsPAPRVTYDevice {
     VIOsPAPRDevice sdev;
-    CharDriverState *chardev;
+    CharBackend chardev;
     uint32_t in, out;
     uint8_t buf[VTERM_BUFSIZE];
 } VIOsPAPRVTYDevice;
@@ -20,7 +25,7 @@ static int vty_can_receive(void *opaque)
 {
     VIOsPAPRVTYDevice *dev = VIO_SPAPR_VTY_DEVICE(opaque);
 
-    return (dev->in - dev->out) < VTERM_BUFSIZE;
+    return VTERM_BUFSIZE - (dev->in - dev->out);
 }
 
 static void vty_receive(void *opaque, const uint8_t *buf, int size)
@@ -33,7 +38,15 @@ static void vty_receive(void *opaque, const uint8_t *buf, int size)
         qemu_irq_pulse(spapr_vio_qirq(&dev->sdev));
     }
     for (i = 0; i < size; i++) {
-        assert((dev->in - dev->out) < VTERM_BUFSIZE);
+        if (dev->in - dev->out >= VTERM_BUFSIZE) {
+            static bool reported;
+            if (!reported) {
+                error_report("VTY input buffer exhausted - characters dropped."
+                             " (input size = %i)", size);
+                reported = true;
+            }
+            break;
+        }
         dev->buf[dev->in++ % VTERM_BUFSIZE] = buf[i];
     }
 }
@@ -47,7 +60,7 @@ static int vty_getchars(VIOsPAPRDevice *sdev, uint8_t *buf, int max)
         buf[n++] = dev->buf[dev->out++ % VTERM_BUFSIZE];
     }
 
-    qemu_chr_accept_input(dev->chardev);
+    qemu_chr_fe_accept_input(&dev->chardev);
 
     return n;
 }
@@ -56,27 +69,26 @@ void vty_putchars(VIOsPAPRDevice *sdev, uint8_t *buf, int len)
 {
     VIOsPAPRVTYDevice *dev = VIO_SPAPR_VTY_DEVICE(sdev);
 
-    /* FIXME: should check the qemu_chr_fe_write() return value */
-    qemu_chr_fe_write(dev->chardev, buf, len);
+    /* XXX this blocks entire thread. Rewrite to use
+     * qemu_chr_fe_write and background I/O callbacks */
+    qemu_chr_fe_write_all(&dev->chardev, buf, len);
 }
 
-static int spapr_vty_init(VIOsPAPRDevice *sdev)
+static void spapr_vty_realize(VIOsPAPRDevice *sdev, Error **errp)
 {
     VIOsPAPRVTYDevice *dev = VIO_SPAPR_VTY_DEVICE(sdev);
 
-    if (!dev->chardev) {
-        fprintf(stderr, "spapr-vty: Can't create vty without a chardev!\n");
-        exit(1);
+    if (!qemu_chr_fe_get_driver(&dev->chardev)) {
+        error_setg(errp, "chardev property not set");
+        return;
     }
 
-    qemu_chr_add_handlers(dev->chardev, vty_can_receive,
-                          vty_receive, NULL, dev);
-
-    return 0;
+    qemu_chr_fe_set_handlers(&dev->chardev, vty_can_receive,
+                             vty_receive, NULL, dev, NULL, true);
 }
 
 /* Forward declaration */
-static target_ulong h_put_term_char(PowerPCCPU *cpu, sPAPREnvironment *spapr,
+static target_ulong h_put_term_char(PowerPCCPU *cpu, sPAPRMachineState *spapr,
                                     target_ulong opcode, target_ulong *args)
 {
     target_ulong reg = args[0];
@@ -103,7 +115,7 @@ static target_ulong h_put_term_char(PowerPCCPU *cpu, sPAPREnvironment *spapr,
     return H_SUCCESS;
 }
 
-static target_ulong h_get_term_char(PowerPCCPU *cpu, sPAPREnvironment *spapr,
+static target_ulong h_get_term_char(PowerPCCPU *cpu, sPAPRMachineState *spapr,
                                     target_ulong opcode, target_ulong *args)
 {
     target_ulong reg = args[0];
@@ -129,7 +141,7 @@ static target_ulong h_get_term_char(PowerPCCPU *cpu, sPAPREnvironment *spapr,
     return H_SUCCESS;
 }
 
-void spapr_vty_create(VIOsPAPRBus *bus, CharDriverState *chardev)
+void spapr_vty_create(VIOsPAPRBus *bus, Chardev *chardev)
 {
     DeviceState *dev;
 
@@ -163,7 +175,7 @@ static void spapr_vty_class_init(ObjectClass *klass, void *data)
     DeviceClass *dc = DEVICE_CLASS(klass);
     VIOsPAPRDeviceClass *k = VIO_SPAPR_DEVICE_CLASS(klass);
 
-    k->init = spapr_vty_init;
+    k->realize = spapr_vty_realize;
     k->dt_name = "vty";
     k->dt_type = "serial";
     k->dt_compatible = "hvterm1";
@@ -195,7 +207,7 @@ VIOsPAPRDevice *spapr_vty_get_default(VIOsPAPRBus *bus)
         DeviceState *iter = kid->child;
 
         /* Only look at VTY devices */
-        if (!object_dynamic_cast(OBJECT(iter), "spapr-vty")) {
+        if (!object_dynamic_cast(OBJECT(iter), TYPE_VIO_SPAPR_VTY_DEVICE)) {
             continue;
         }
 
@@ -216,7 +228,7 @@ VIOsPAPRDevice *spapr_vty_get_default(VIOsPAPRBus *bus)
     return selected;
 }
 
-VIOsPAPRDevice *vty_lookup(sPAPREnvironment *spapr, target_ulong reg)
+VIOsPAPRDevice *vty_lookup(sPAPRMachineState *spapr, target_ulong reg)
 {
     VIOsPAPRDevice *sdev;
 
@@ -228,6 +240,10 @@ VIOsPAPRDevice *vty_lookup(sPAPREnvironment *spapr, target_ulong reg)
          * (early debug does work there, despite having no vty with
          * reg==0. */
         return spapr_vty_get_default(spapr->vio_bus);
+    }
+
+    if (!object_dynamic_cast(OBJECT(sdev), TYPE_VIO_SPAPR_VTY_DEVICE)) {
+        return NULL;
     }
 
     return sdev;

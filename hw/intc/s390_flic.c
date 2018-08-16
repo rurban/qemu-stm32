@@ -10,11 +10,14 @@
  * directory.
  */
 
+#include "qemu/osdep.h"
 #include "qemu/error-report.h"
 #include "hw/sysbus.h"
 #include "migration/qemu-file.h"
 #include "hw/s390x/s390_flic.h"
 #include "trace.h"
+#include "hw/qdev.h"
+#include "qapi/error.h"
 
 S390FLICState *s390_get_flic(void)
 {
@@ -30,7 +33,6 @@ S390FLICState *s390_get_flic(void)
 void s390_flic_init(void)
 {
     DeviceState *dev;
-    int r;
 
     dev = s390_flic_kvm_create();
     if (!dev) {
@@ -38,10 +40,7 @@ void s390_flic_init(void)
         object_property_add_child(qdev_get_machine(), TYPE_QEMU_S390_FLIC,
                                   OBJECT(dev), NULL);
     }
-    r = qdev_init(dev);
-    if (r) {
-        error_report("flic: couldn't create qdev");
-    }
+    qdev_init_nofail(dev);
 }
 
 static int qemu_s390_register_io_adapter(S390FLICState *fs, uint32_t id,
@@ -70,6 +69,13 @@ static void qemu_s390_release_adapter_routes(S390FLICState *fs,
 {
 }
 
+static int qemu_s390_clear_io_flic(S390FLICState *fs, uint16_t subchannel_id,
+                           uint16_t subchannel_nr)
+{
+    /* Fixme TCG */
+    return -ENOSYS;
+}
+
 static void qemu_s390_flic_class_init(ObjectClass *oc, void *data)
 {
     S390FLICStateClass *fsc = S390_FLIC_COMMON_CLASS(oc);
@@ -78,6 +84,31 @@ static void qemu_s390_flic_class_init(ObjectClass *oc, void *data)
     fsc->io_adapter_map = qemu_s390_io_adapter_map;
     fsc->add_adapter_routes = qemu_s390_add_adapter_routes;
     fsc->release_adapter_routes = qemu_s390_release_adapter_routes;
+    fsc->clear_io_irq = qemu_s390_clear_io_flic;
+}
+
+static Property s390_flic_common_properties[] = {
+    DEFINE_PROP_UINT32("adapter_routes_max_batch", S390FLICState,
+                       adapter_routes_max_batch, ADAPTER_ROUTES_MAX_GSI),
+    DEFINE_PROP_END_OF_LIST(),
+};
+
+static void s390_flic_common_realize(DeviceState *dev, Error **errp)
+{
+    uint32_t max_batch = S390_FLIC_COMMON(dev)->adapter_routes_max_batch;
+
+    if (max_batch > ADAPTER_ROUTES_MAX_GSI) {
+        error_setg(errp, "flic adapter_routes_max_batch too big"
+                   "%d (%d allowed)", max_batch, ADAPTER_ROUTES_MAX_GSI);
+    }
+}
+
+static void s390_flic_class_init(ObjectClass *oc, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(oc);
+
+    dc->props = s390_flic_common_properties;
+    dc->realize = s390_flic_common_realize;
 }
 
 static const TypeInfo qemu_s390_flic_info = {
@@ -87,10 +118,12 @@ static const TypeInfo qemu_s390_flic_info = {
     .class_init    = qemu_s390_flic_class_init,
 };
 
+
 static const TypeInfo s390_flic_common_info = {
     .name          = TYPE_S390_FLIC_COMMON,
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(S390FLICState),
+    .class_init    = s390_flic_class_init,
     .class_size    = sizeof(S390FLICStateClass),
 };
 

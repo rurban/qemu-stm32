@@ -21,6 +21,8 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+#include "qemu/osdep.h"
+#include "cpu.h"
 #include "hw/hw.h"
 #include "hw/ppc/ppc.h"
 #include "hw/ppc/ppc4xx.h"
@@ -422,7 +424,7 @@ static void sdram_set_bcr(ppc4xx_sdram_t *sdram,
                                     &sdram->containers[n]);
         memory_region_del_subregion(&sdram->containers[n],
                                     &sdram->ram_memories[n]);
-        memory_region_destroy(&sdram->containers[n]);
+        object_unparent(OBJECT(&sdram->containers[n]));
     }
     *bcrp = bcr & 0xFFDEE001;
     if (enabled && (bcr & 0x00000001)) {

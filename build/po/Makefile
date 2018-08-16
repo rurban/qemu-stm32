@@ -1,0 +1,1 @@
+/data/software/qemu/po/Makefile

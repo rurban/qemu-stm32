@@ -22,7 +22,7 @@
 
 #define CMD_FLAG_GLOBAL ((int)0x80000000) /* don't iterate "args" */
 
-typedef int (*cfunc_t)(BlockDriverState *bs, int argc, char **argv);
+typedef int (*cfunc_t)(BlockBackend *blk, int argc, char **argv);
 typedef void (*helpfunc_t)(void);
 
 typedef struct cmdinfo {
@@ -36,11 +36,12 @@ typedef struct cmdinfo {
     const char  *args;
     const char  *oneline;
     helpfunc_t  help;
+    uint64_t    perm;
 } cmdinfo_t;
 
 extern bool qemuio_misalign;
 
-bool qemuio_command(BlockDriverState *bs, const char *cmd);
+bool qemuio_command(BlockBackend *blk, const char *cmd);
 
 void qemuio_add_command(const cmdinfo_t *ci);
 int qemuio_command_usage(const cmdinfo_t *ci);

@@ -14,6 +14,7 @@ void esp_init(hwaddr espaddr, int it_shift,
 
 #define ESP_REGS 16
 #define TI_BUFSZ 16
+#define ESP_CMDBUF_SZ 32
 
 typedef struct ESPState ESPState;
 
@@ -22,6 +23,7 @@ struct ESPState {
     uint8_t wregs[ESP_REGS];
     qemu_irq irq;
     uint8_t chip_id;
+    bool tchi_written;
     int32_t ti_size;
     uint32_t ti_rptr, ti_wptr;
     uint32_t status;
@@ -30,7 +32,7 @@ struct ESPState {
     SCSIBus bus;
     SCSIDevice *current_dev;
     SCSIRequest *current_req;
-    uint8_t cmdbuf[TI_BUFSZ];
+    uint8_t cmdbuf[ESP_CMDBUF_SZ];
     uint32_t cmdlen;
     uint32_t do_cmd;
 

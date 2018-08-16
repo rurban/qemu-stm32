@@ -12,6 +12,7 @@
  *
  */
 
+#include "qemu/osdep.h"
 #include "qed.h"
 
 /**
@@ -82,6 +83,7 @@ static void qed_find_cluster_cb(void *opaque, int ret)
     unsigned int index;
     unsigned int n;
 
+    qed_acquire(s);
     if (ret) {
         goto out;
     }
@@ -108,6 +110,7 @@ static void qed_find_cluster_cb(void *opaque, int ret)
 
 out:
     find_cluster_cb->cb(find_cluster_cb->opaque, ret, offset, len);
+    qed_release(s);
     g_free(find_cluster_cb);
 }
 

@@ -22,10 +22,12 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+#include "qemu/osdep.h"
 #include "hw/hw.h"
-#include "hw/nvram/openbios_firmware_abi.h"
-#include "sysemu/sysemu.h"
+#include "hw/nvram/chrp_nvram.h"
 #include "hw/ppc/mac.h"
+#include "qemu/cutils.h"
+#include <zlib.h>
 
 /* debug NVR */
 //#define DEBUG_NVR
@@ -39,29 +41,6 @@
 
 #define DEF_SYSTEM_SIZE 0xc10
 
-/* Direct access to NVRAM */
-uint8_t macio_nvram_read(MacIONVRAMState *s, uint32_t addr)
-{
-    uint32_t ret;
-
-    if (addr < s->size) {
-        ret = s->data[addr];
-    } else {
-        ret = -1;
-    }
-    NVR_DPRINTF("read addr %04" PRIx32 " val %" PRIx8 "\n", addr, ret);
-
-    return ret;
-}
-
-void macio_nvram_write(MacIONVRAMState *s, uint32_t addr, uint8_t val)
-{
-    NVR_DPRINTF("write addr %04" PRIx32 " val %" PRIx8 "\n", addr, val);
-    if (addr < s->size) {
-        s->data[addr] = val;
-    }
-}
-
 /* macio style NVRAM device */
 static void macio_nvram_writeb(void *opaque, hwaddr addr,
                                uint64_t value, unsigned size)
@@ -70,7 +49,8 @@ static void macio_nvram_writeb(void *opaque, hwaddr addr,
 
     addr = (addr >> s->it_shift) & (s->size - 1);
     s->data[addr] = value;
-    NVR_DPRINTF("writeb addr %04" PHYS_PRIx " val %" PRIx64 "\n", addr, value);
+    NVR_DPRINTF("writeb addr %04" HWADDR_PRIx " val %" PRIx64 "\n",
+                addr, value);
 }
 
 static uint64_t macio_nvram_readb(void *opaque, hwaddr addr,
@@ -81,7 +61,8 @@ static uint64_t macio_nvram_readb(void *opaque, hwaddr addr,
 
     addr = (addr >> s->it_shift) & (s->size - 1);
     value = s->data[addr];
-    NVR_DPRINTF("readb addr %04x val %x\n", (int)addr, value);
+    NVR_DPRINTF("readb addr %04" HWADDR_PRIx " val %" PRIx32 "\n",
+                addr, value);
 
     return value;
 }
@@ -89,6 +70,10 @@ static uint64_t macio_nvram_readb(void *opaque, hwaddr addr,
 static const MemoryRegionOps macio_nvram_ops = {
     .read = macio_nvram_readb,
     .write = macio_nvram_writeb,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 1,
     .endianness = DEVICE_BIG_ENDIAN,
 };
 
@@ -97,7 +82,7 @@ static const VMStateDescription vmstate_macio_nvram = {
     .version_id = 1,
     .minimum_version_id = 1,
     .fields = (VMStateField[]) {
-        VMSTATE_VBUFFER_UINT32(data, MacIONVRAMState, 0, NULL, 0, size),
+        VMSTATE_VBUFFER_UINT32(data, MacIONVRAMState, 0, NULL, size),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -141,6 +126,7 @@ static void macio_nvram_class_init(ObjectClass *oc, void *data)
     dc->reset = macio_nvram_reset;
     dc->vmsd = &vmstate_macio_nvram;
     dc->props = macio_nvram_properties;
+    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
 }
 
 static const TypeInfo macio_nvram_type_info = {
@@ -156,40 +142,52 @@ static void macio_nvram_register_types(void)
 }
 
 /* Set up a system OpenBIOS NVRAM partition */
-void pmac_format_nvram_partition (MacIONVRAMState *nvr, int len)
+static void pmac_format_nvram_partition_of(MacIONVRAMState *nvr, int off,
+                                           int len)
 {
-    unsigned int i;
-    uint32_t start = 0, end;
-    struct OpenBIOS_nvpart_v1 *part_header;
+    int sysp_end;
 
-    // OpenBIOS nvram variables
-    // Variable partition
-    part_header = (struct OpenBIOS_nvpart_v1 *)nvr->data;
-    part_header->signature = OPENBIOS_PART_SYSTEM;
-    pstrcpy(part_header->name, sizeof(part_header->name), "system");
+    /* OpenBIOS nvram variables partition */
+    sysp_end = chrp_nvram_create_system_partition(&nvr->data[off],
+                                                  DEF_SYSTEM_SIZE) + off;
 
-    end = start + sizeof(struct OpenBIOS_nvpart_v1);
-    for (i = 0; i < nb_prom_envs; i++)
-        end = OpenBIOS_set_var(nvr->data, end, prom_envs[i]);
-
-    // End marker
-    nvr->data[end++] = '\0';
-
-    end = start + ((end - start + 15) & ~15);
-    /* XXX: OpenBIOS is not able to grow up a partition. Leave some space for
-       new variables. */
-    if (end < DEF_SYSTEM_SIZE)
-        end = DEF_SYSTEM_SIZE;
-    OpenBIOS_finish_partition(part_header, end - start);
-
-    // free partition
-    start = end;
-    part_header = (struct OpenBIOS_nvpart_v1 *)&nvr->data[start];
-    part_header->signature = OPENBIOS_PART_FREE;
-    pstrcpy(part_header->name, sizeof(part_header->name), "free");
-
-    end = len;
-    OpenBIOS_finish_partition(part_header, end - start);
+    /* Free space partition */
+    chrp_nvram_create_free_partition(&nvr->data[sysp_end], len - sysp_end);
 }
 
+#define OSX_NVRAM_SIGNATURE     (0x5A)
+
+/* Set up a Mac OS X NVRAM partition */
+static void pmac_format_nvram_partition_osx(MacIONVRAMState *nvr, int off,
+                                            int len)
+{
+    uint32_t start = off;
+    ChrpNvramPartHdr *part_header;
+    unsigned char *data = &nvr->data[start];
+
+    /* empty partition */
+    part_header = (ChrpNvramPartHdr *)data;
+    part_header->signature = OSX_NVRAM_SIGNATURE;
+    pstrcpy(part_header->name, sizeof(part_header->name), "wwwwwwwwwwww");
+
+    chrp_nvram_finish_partition(part_header, len);
+
+    /* Generation */
+    stl_be_p(&data[20], 2);
+
+    /* Adler32 checksum */
+    stl_be_p(&data[16], adler32(0, &data[20], len - 20));
+}
+
+/* Set up NVRAM with OF and OSX partitions */
+void pmac_format_nvram_partition(MacIONVRAMState *nvr, int len)
+{
+    /*
+     * Mac OS X expects side "B" of the flash at the second half of NVRAM,
+     * so we use half of the chip for OF and the other half for a free OSX
+     * partition.
+     */
+    pmac_format_nvram_partition_of(nvr, 0, len / 2);
+    pmac_format_nvram_partition_osx(nvr, len / 2, len / 2);
+}
 type_init(macio_nvram_register_types)

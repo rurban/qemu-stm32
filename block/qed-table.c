@@ -12,9 +12,11 @@
  *
  */
 
+#include "qemu/osdep.h"
 #include "trace.h"
 #include "qemu/sockets.h" /* for EINPROGRESS on Windows */
 #include "qed.h"
+#include "qemu/bswap.h"
 
 typedef struct {
     GenericCB gencb;
@@ -29,6 +31,7 @@ static void qed_read_table_cb(void *opaque, int ret)
 {
     QEDReadTableCB *read_table_cb = opaque;
     QEDTable *table = read_table_cb->table;
+    BDRVQEDState *s = read_table_cb->s;
     int noffsets = read_table_cb->qiov.size / sizeof(uint64_t);
     int i;
 
@@ -38,18 +41,20 @@ static void qed_read_table_cb(void *opaque, int ret)
     }
 
     /* Byteswap offsets */
+    qed_acquire(s);
     for (i = 0; i < noffsets; i++) {
         table->offsets[i] = le64_to_cpu(table->offsets[i]);
     }
+    qed_release(s);
 
 out:
     /* Completion */
-    trace_qed_read_table_cb(read_table_cb->s, read_table_cb->table, ret);
+    trace_qed_read_table_cb(s, read_table_cb->table, ret);
     gencb_complete(&read_table_cb->gencb, ret);
 }
 
 static void qed_read_table(BDRVQEDState *s, uint64_t offset, QEDTable *table,
-                           BlockDriverCompletionFunc *cb, void *opaque)
+                           BlockCompletionFunc *cb, void *opaque)
 {
     QEDReadTableCB *read_table_cb = gencb_alloc(sizeof(*read_table_cb),
                                                 cb, opaque);
@@ -82,8 +87,9 @@ typedef struct {
 static void qed_write_table_cb(void *opaque, int ret)
 {
     QEDWriteTableCB *write_table_cb = opaque;
+    BDRVQEDState *s = write_table_cb->s;
 
-    trace_qed_write_table_cb(write_table_cb->s,
+    trace_qed_write_table_cb(s,
                              write_table_cb->orig_table,
                              write_table_cb->flush,
                              ret);
@@ -95,8 +101,10 @@ static void qed_write_table_cb(void *opaque, int ret)
     if (write_table_cb->flush) {
         /* We still need to flush first */
         write_table_cb->flush = false;
+        qed_acquire(s);
         bdrv_aio_flush(write_table_cb->s->bs, qed_write_table_cb,
                        write_table_cb);
+        qed_release(s);
         return;
     }
 
@@ -119,7 +127,7 @@ out:
  */
 static void qed_write_table(BDRVQEDState *s, uint64_t offset, QEDTable *table,
                             unsigned int index, unsigned int n, bool flush,
-                            BlockDriverCompletionFunc *cb, void *opaque)
+                            BlockCompletionFunc *cb, void *opaque)
 {
     QEDWriteTableCB *write_table_cb;
     unsigned int sector_mask = BDRV_SECTOR_SIZE / sizeof(uint64_t) - 1;
@@ -172,15 +180,13 @@ int qed_read_l1_table_sync(BDRVQEDState *s)
 
     qed_read_table(s, s->header.l1_table_offset,
                    s->l1_table, qed_sync_cb, &ret);
-    while (ret == -EINPROGRESS) {
-        aio_poll(bdrv_get_aio_context(s->bs), true);
-    }
+    BDRV_POLL_WHILE(s->bs, ret == -EINPROGRESS);
 
     return ret;
 }
 
 void qed_write_l1_table(BDRVQEDState *s, unsigned int index, unsigned int n,
-                        BlockDriverCompletionFunc *cb, void *opaque)
+                        BlockCompletionFunc *cb, void *opaque)
 {
     BLKDBG_EVENT(s->bs->file, BLKDBG_L1_UPDATE);
     qed_write_table(s, s->header.l1_table_offset,
@@ -193,9 +199,7 @@ int qed_write_l1_table_sync(BDRVQEDState *s, unsigned int index,
     int ret = -EINPROGRESS;
 
     qed_write_l1_table(s, index, n, qed_sync_cb, &ret);
-    while (ret == -EINPROGRESS) {
-        aio_poll(bdrv_get_aio_context(s->bs), true);
-    }
+    BDRV_POLL_WHILE(s->bs, ret == -EINPROGRESS);
 
     return ret;
 }
@@ -215,6 +219,7 @@ static void qed_read_l2_table_cb(void *opaque, int ret)
     CachedL2Table *l2_table = request->l2_table;
     uint64_t l2_offset = read_l2_table_cb->l2_offset;
 
+    qed_acquire(s);
     if (ret) {
         /* can't trust loaded L2 table anymore */
         qed_unref_l2_cache_entry(l2_table);
@@ -230,12 +235,13 @@ static void qed_read_l2_table_cb(void *opaque, int ret)
         request->l2_table = qed_find_l2_cache_entry(&s->l2_cache, l2_offset);
         assert(request->l2_table != NULL);
     }
+    qed_release(s);
 
     gencb_complete(&read_l2_table_cb->gencb, ret);
 }
 
 void qed_read_l2_table(BDRVQEDState *s, QEDRequest *request, uint64_t offset,
-                       BlockDriverCompletionFunc *cb, void *opaque)
+                       BlockCompletionFunc *cb, void *opaque)
 {
     QEDReadL2TableCB *read_l2_table_cb;
 
@@ -266,16 +272,14 @@ int qed_read_l2_table_sync(BDRVQEDState *s, QEDRequest *request, uint64_t offset
     int ret = -EINPROGRESS;
 
     qed_read_l2_table(s, request, offset, qed_sync_cb, &ret);
-    while (ret == -EINPROGRESS) {
-        aio_poll(bdrv_get_aio_context(s->bs), true);
-    }
+    BDRV_POLL_WHILE(s->bs, ret == -EINPROGRESS);
 
     return ret;
 }
 
 void qed_write_l2_table(BDRVQEDState *s, QEDRequest *request,
                         unsigned int index, unsigned int n, bool flush,
-                        BlockDriverCompletionFunc *cb, void *opaque)
+                        BlockCompletionFunc *cb, void *opaque)
 {
     BLKDBG_EVENT(s->bs->file, BLKDBG_L2_UPDATE);
     qed_write_table(s, request->l2_table->offset,
@@ -288,9 +292,7 @@ int qed_write_l2_table_sync(BDRVQEDState *s, QEDRequest *request,
     int ret = -EINPROGRESS;
 
     qed_write_l2_table(s, request, index, n, flush, qed_sync_cb, &ret);
-    while (ret == -EINPROGRESS) {
-        aio_poll(bdrv_get_aio_context(s->bs), true);
-    }
+    BDRV_POLL_WHILE(s->bs, ret == -EINPROGRESS);
 
     return ret;
 }

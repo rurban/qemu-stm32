@@ -22,6 +22,10 @@
  * THE SOFTWARE.
  */
 
+#include "qemu/osdep.h"
+#include "qapi/error.h"
+#include "qemu-common.h"
+#include "cpu.h"
 #include <sys/ioctl.h>
 #include "exec/address-spaces.h"
 #include "hw/hw.h"
@@ -45,6 +49,7 @@ typedef struct KVMOpenPICState {
     MemoryListener mem_listener;
     uint32_t fd;
     uint32_t model;
+    hwaddr mapped;
 } KVMOpenPICState;
 
 static void kvm_openpic_set_irq(void *opaque, int n_IRQ, int level)
@@ -128,7 +133,16 @@ static void kvm_openpic_region_add(MemoryListener *listener,
         return;
     }
 
+    if (opp->mapped) {
+        /*
+         * We can only map the MPIC once. Since we are already mapped,
+         * the best we can do is ignore new maps.
+         */
+        return;
+    }
+
     reg_base = section->offset_within_address_space;
+    opp->mapped = reg_base;
 
     attr.group = KVM_DEV_MPIC_GRP_MISC;
     attr.attr = KVM_DEV_MPIC_BASE_ADDR;
@@ -154,6 +168,15 @@ static void kvm_openpic_region_del(MemoryListener *listener,
     if (section->mr != &opp->mem) {
         return;
     }
+
+    if (section->offset_within_address_space != opp->mapped) {
+        /*
+         * We can only map the MPIC once. This mapping was a secondary
+         * one that we couldn't fulfill. Ignore it.
+         */
+        return;
+    }
+    opp->mapped = 0;
 
     attr.group = KVM_DEV_MPIC_GRP_MISC;
     attr.attr = KVM_DEV_MPIC_BASE_ADDR;
@@ -219,7 +242,7 @@ static void kvm_openpic_realize(DeviceState *dev, Error **errp)
     memory_listener_register(&opp->mem_listener, &address_space_memory);
 
     /* indicate pic capabilities */
-    msi_supported = true;
+    msi_nonbroken = true;
     kvm_kernel_irqchip = true;
     kvm_async_interrupts_allowed = true;
 
@@ -229,7 +252,6 @@ static void kvm_openpic_realize(DeviceState *dev, Error **errp)
         kvm_irqchip_add_irq_route(kvm_state, i, 0, i);
     }
 
-    kvm_irqfds_allowed = true;
     kvm_msi_via_irqfd_allowed = true;
     kvm_gsi_routing_allowed = true;
 
@@ -257,6 +279,7 @@ static void kvm_openpic_class_init(ObjectClass *oc, void *data)
     dc->realize = kvm_openpic_realize;
     dc->props = kvm_openpic_properties;
     dc->reset = kvm_openpic_reset;
+    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
 }
 
 static const TypeInfo kvm_openpic_info = {

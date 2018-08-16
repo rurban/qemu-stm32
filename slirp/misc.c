@@ -5,20 +5,16 @@
  * terms and conditions of the copyright.
  */
 
-#include <slirp.h>
-#include <libslirp.h>
-
+#include "qemu/osdep.h"
+#include "slirp.h"
+#include "libslirp.h"
 #include "monitor/monitor.h"
+#include "qemu/error-report.h"
 #include "qemu/main-loop.h"
 
 #ifdef DEBUG
 int slirp_debug = DBG_CALL|DBG_MISC|DBG_ERROR;
 #endif
-
-struct quehead {
-	struct quehead *qh_link;
-	struct quehead *qh_rlink;
-};
 
 inline void
 insque(void *a, void *b)
@@ -54,35 +50,14 @@ int add_exec(struct ex_list **ex_ptr, int do_pty, char *exec,
 	}
 
 	tmp_ptr = *ex_ptr;
-	*ex_ptr = (struct ex_list *)malloc(sizeof(struct ex_list));
+	*ex_ptr = g_new(struct ex_list, 1);
 	(*ex_ptr)->ex_fport = port;
 	(*ex_ptr)->ex_addr = addr;
 	(*ex_ptr)->ex_pty = do_pty;
-	(*ex_ptr)->ex_exec = (do_pty == 3) ? exec : strdup(exec);
+	(*ex_ptr)->ex_exec = (do_pty == 3) ? exec : g_strdup(exec);
 	(*ex_ptr)->ex_next = tmp_ptr;
 	return 0;
 }
-
-#ifndef HAVE_STRERROR
-
-/*
- * For systems with no strerror
- */
-
-extern int sys_nerr;
-extern char *sys_errlist[];
-
-char *
-strerror(error)
-	int error;
-{
-	if (error < sys_nerr)
-	   return sys_errlist[error];
-	else
-	   return "Unknown error.";
-}
-
-#endif
 
 
 #ifdef _WIN32
@@ -122,9 +97,9 @@ fork_exec(struct socket *so, const char *ex, int do_pty)
 	pid_t pid;
 
 	DEBUG_CALL("fork_exec");
-	DEBUG_ARG("so = %lx", (long)so);
-	DEBUG_ARG("ex = %lx", (long)ex);
-	DEBUG_ARG("do_pty = %lx", (long)do_pty);
+	DEBUG_ARG("so = %p", so);
+	DEBUG_ARG("ex = %p", ex);
+	DEBUG_ARG("do_pty = %x", do_pty);
 
 	if (do_pty == 2) {
                 return 0;
@@ -187,7 +162,7 @@ fork_exec(struct socket *so, const char *ex, int do_pty)
 			   bptr++;
 			c = *bptr;
 			*bptr++ = (char)0;
-			argv[i++] = strdup(curarg);
+			argv[i++] = g_strdup(curarg);
 		   } while (c);
 
                 argv[i] = NULL;
@@ -225,20 +200,6 @@ fork_exec(struct socket *so, const char *ex, int do_pty)
 
 		return 1;
 	}
-}
-#endif
-
-#ifndef HAVE_STRDUP
-char *
-strdup(str)
-	const char *str;
-{
-	char *bptr;
-
-	bptr = (char *)malloc(strlen(str)+1);
-	strcpy(bptr, str);
-
-	return bptr;
 }
 #endif
 

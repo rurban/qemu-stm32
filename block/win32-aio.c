@@ -21,12 +21,13 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+#include "qemu/osdep.h"
 #include "qemu-common.h"
 #include "qemu/timer.h"
 #include "block/block_int.h"
 #include "qemu/module.h"
 #include "block/aio.h"
-#include "raw-aio.h"
+#include "block/raw-aio.h"
 #include "qemu/event_notifier.h"
 #include "qemu/iov.h"
 #include <windows.h>
@@ -40,11 +41,11 @@ struct QEMUWin32AIOState {
     HANDLE hIOCP;
     EventNotifier e;
     int count;
-    bool is_aio_context_attached;
+    AioContext *aio_ctx;
 };
 
 typedef struct QEMUWin32AIOCB {
-    BlockDriverAIOCB common;
+    BlockAIOCB common;
     struct QEMUWin32AIOState *ctx;
     int nbytes;
     OVERLAPPED ov;
@@ -86,9 +87,8 @@ static void win32_aio_process_completion(QEMUWin32AIOState *s,
         qemu_vfree(waiocb->buf);
     }
 
-
     waiocb->common.cb(waiocb->common.opaque, ret);
-    qemu_aio_release(waiocb);
+    qemu_aio_unref(waiocb);
 }
 
 static void win32_aio_completion_cb(EventNotifier *e)
@@ -106,28 +106,14 @@ static void win32_aio_completion_cb(EventNotifier *e)
     }
 }
 
-static void win32_aio_cancel(BlockDriverAIOCB *blockacb)
-{
-    QEMUWin32AIOCB *waiocb = (QEMUWin32AIOCB *)blockacb;
-
-    /*
-     * CancelIoEx is only supported in Vista and newer.  For now, just
-     * wait for completion.
-     */
-    while (!HasOverlappedIoCompleted(&waiocb->ov)) {
-        aio_poll(bdrv_get_aio_context(blockacb->bs), true);
-    }
-}
-
 static const AIOCBInfo win32_aiocb_info = {
     .aiocb_size         = sizeof(QEMUWin32AIOCB),
-    .cancel             = win32_aio_cancel,
 };
 
-BlockDriverAIOCB *win32_aio_submit(BlockDriverState *bs,
+BlockAIOCB *win32_aio_submit(BlockDriverState *bs,
         QEMUWin32AIOState *aio, HANDLE hfile,
         int64_t sector_num, QEMUIOVector *qiov, int nb_sectors,
-        BlockDriverCompletionFunc *cb, void *opaque, int type)
+        BlockCompletionFunc *cb, void *opaque, int type)
 {
     struct QEMUWin32AIOCB *waiocb;
     uint64_t offset = sector_num * 512;
@@ -139,7 +125,10 @@ BlockDriverAIOCB *win32_aio_submit(BlockDriverState *bs,
     waiocb->is_read = (type == QEMU_AIO_READ);
 
     if (qiov->niov > 1) {
-        waiocb->buf = qemu_blockalign(bs, qiov->size);
+        waiocb->buf = qemu_try_blockalign(bs, qiov->size);
+        if (waiocb->buf == NULL) {
+            goto out;
+        }
         if (type & QEMU_AIO_WRITE) {
             iov_to_buf(qiov->iov, qiov->niov, 0, waiocb->buf, qiov->size);
         }
@@ -168,7 +157,8 @@ BlockDriverAIOCB *win32_aio_submit(BlockDriverState *bs,
 
 out_dec_count:
     aio->count--;
-    qemu_aio_release(waiocb);
+out:
+    qemu_aio_unref(waiocb);
     return NULL;
 }
 
@@ -184,15 +174,16 @@ int win32_aio_attach(QEMUWin32AIOState *aio, HANDLE hfile)
 void win32_aio_detach_aio_context(QEMUWin32AIOState *aio,
                                   AioContext *old_context)
 {
-    aio_set_event_notifier(old_context, &aio->e, NULL);
-    aio->is_aio_context_attached = false;
+    aio_set_event_notifier(old_context, &aio->e, false, NULL, NULL);
+    aio->aio_ctx = NULL;
 }
 
 void win32_aio_attach_aio_context(QEMUWin32AIOState *aio,
                                   AioContext *new_context)
 {
-    aio->is_aio_context_attached = true;
-    aio_set_event_notifier(new_context, &aio->e, win32_aio_completion_cb);
+    aio->aio_ctx = new_context;
+    aio_set_event_notifier(new_context, &aio->e, false,
+                           win32_aio_completion_cb, NULL);
 }
 
 QEMUWin32AIOState *win32_aio_init(void)
@@ -220,7 +211,7 @@ out_free_state:
 
 void win32_aio_cleanup(QEMUWin32AIOState *aio)
 {
-    assert(!aio->is_aio_context_attached);
+    assert(!aio->aio_ctx);
     CloseHandle(aio->hIOCP);
     event_notifier_cleanup(&aio->e);
     g_free(aio);

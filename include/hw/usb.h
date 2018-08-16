@@ -26,6 +26,7 @@
  */
 
 #include "hw/qdev.h"
+#include "qemu/iov.h"
 #include "qemu/queue.h"
 
 /* Constants related to the USB / PCI interaction */
@@ -134,6 +135,8 @@
 #define USB_REQ_GET_INTERFACE		0x0A
 #define USB_REQ_SET_INTERFACE		0x0B
 #define USB_REQ_SYNCH_FRAME		0x0C
+#define USB_REQ_SET_SEL                 0x30
+#define USB_REQ_SET_ISOCH_DELAY         0x31
 
 #define USB_DEVICE_SELF_POWERED		0
 #define USB_DEVICE_REMOTE_WAKEUP	1
@@ -234,7 +237,7 @@ struct USBDevice {
     uint8_t addr;
     char product_desc[32];
     int auto_attach;
-    int attached;
+    bool attached;
 
     int32_t state;
     uint8_t setup_buf[8];
@@ -267,10 +270,14 @@ struct USBDevice {
 #define USB_DEVICE_GET_CLASS(obj) \
      OBJECT_GET_CLASS(USBDeviceClass, (obj), TYPE_USB_DEVICE)
 
+typedef void (*USBDeviceRealize)(USBDevice *dev, Error **errp);
+typedef void (*USBDeviceUnrealize)(USBDevice *dev, Error **errp);
+
 typedef struct USBDeviceClass {
     DeviceClass parent_class;
 
-    int (*init)(USBDevice *dev);
+    USBDeviceRealize realize;
+    USBDeviceUnrealize unrealize;
 
     /*
      * Walk (enabled) downstream ports, check for a matching device.
@@ -282,11 +289,6 @@ typedef struct USBDeviceClass {
      * Called when a packet is canceled.
      */
     void (*cancel_packet)(USBDevice *dev, USBPacket *p);
-
-    /*
-     * Called when device is destroyed.
-     */
-    void (*handle_destroy)(USBDevice *dev);
 
     /*
      * Attach the device
@@ -342,6 +344,7 @@ typedef struct USBDeviceClass {
 
     const char *product_desc;
     const USBDesc *usb_desc;
+    bool attached_settable;
 } USBDeviceClass;
 
 typedef struct USBPortOps {
@@ -441,15 +444,11 @@ void usb_ep_reset(USBDevice *dev);
 void usb_ep_dump(USBDevice *dev);
 struct USBEndpoint *usb_ep_get(USBDevice *dev, int pid, int ep);
 uint8_t usb_ep_get_type(USBDevice *dev, int pid, int ep);
-uint8_t usb_ep_get_ifnum(USBDevice *dev, int pid, int ep);
 void usb_ep_set_type(USBDevice *dev, int pid, int ep, uint8_t type);
 void usb_ep_set_ifnum(USBDevice *dev, int pid, int ep, uint8_t ifnum);
 void usb_ep_set_max_packet_size(USBDevice *dev, int pid, int ep,
                                 uint16_t raw);
-int usb_ep_get_max_packet_size(USBDevice *dev, int pid, int ep);
 void usb_ep_set_max_streams(USBDevice *dev, int pid, int ep, uint8_t raw);
-int usb_ep_get_max_streams(USBDevice *dev, int pid, int ep);
-void usb_ep_set_pipeline(USBDevice *dev, int pid, int ep, bool enabled);
 void usb_ep_set_halted(USBDevice *dev, int pid, int ep, bool halted);
 USBPacket *usb_ep_find_packet_by_id(USBDevice *dev, int pid, int ep,
                                     uint64_t id);
@@ -465,17 +464,18 @@ void usb_port_reset(USBPort *port);
 void usb_device_reset(USBDevice *dev);
 void usb_wakeup(USBEndpoint *ep, unsigned int stream);
 void usb_generic_async_ctrl_complete(USBDevice *s, USBPacket *p);
-int set_usb_string(uint8_t *buf, const char *str);
 
 /* usb-linux.c */
 USBDevice *usb_host_device_open(USBBus *bus, const char *devname);
-void usb_host_info(Monitor *mon, const QDict *qdict);
+void hmp_info_usbhost(Monitor *mon, const QDict *qdict);
+bool usb_host_dev_is_scsi_storage(USBDevice *usbdev);
 
 /* usb ports of the VM */
 
 #define VM_USB_HUB_SIZE 8
 
-/* usb-musb.c */
+/* hw/usb/hdc-musb.c */
+
 enum musb_irq_source_e {
     musb_irq_suspend = 0,
     musb_irq_resume,
@@ -494,6 +494,10 @@ enum musb_irq_source_e {
 };
 
 typedef struct MUSBState MUSBState;
+
+extern CPUReadMemoryFunc * const musb_read[];
+extern CPUWriteMemoryFunc * const musb_write[];
+
 MUSBState *musb_init(DeviceState *parent_device, int gpio_base);
 void musb_reset(MUSBState *s);
 uint32_t musb_core_intr_get(MUSBState *s);
@@ -517,13 +521,15 @@ struct USBBus {
 };
 
 struct USBBusOps {
-    int (*register_companion)(USBBus *bus, USBPort *ports[],
-                              uint32_t portcount, uint32_t firstport);
+    void (*register_companion)(USBBus *bus, USBPort *ports[],
+                               uint32_t portcount, uint32_t firstport,
+                               Error **errp);
     void (*wakeup_endpoint)(USBBus *bus, USBEndpoint *ep, unsigned int stream);
 };
 
 void usb_bus_new(USBBus *bus, size_t bus_size,
                  USBBusOps *ops, DeviceState *host);
+void usb_bus_release(USBBus *bus);
 USBBus *usb_bus_find(int busnr);
 void usb_legacy_register(const char *typename, const char *usbdevice_name,
                          USBDevice *(*usbdevice_init)(USBBus *bus,
@@ -533,16 +539,18 @@ USBDevice *usb_create_simple(USBBus *bus, const char *name);
 USBDevice *usbdevice_create(const char *cmdline);
 void usb_register_port(USBBus *bus, USBPort *port, void *opaque, int index,
                        USBPortOps *ops, int speedmask);
-int usb_register_companion(const char *masterbus, USBPort *ports[],
-                           uint32_t portcount, uint32_t firstport,
-                           void *opaque, USBPortOps *ops, int speedmask);
+void usb_register_companion(const char *masterbus, USBPort *ports[],
+                            uint32_t portcount, uint32_t firstport,
+                            void *opaque, USBPortOps *ops, int speedmask,
+                            Error **errp);
 void usb_port_location(USBPort *downstream, USBPort *upstream, int portnr);
 void usb_unregister_port(USBBus *bus, USBPort *port);
-int usb_claim_port(USBDevice *dev);
+void usb_claim_port(USBDevice *dev, Error **errp);
 void usb_release_port(USBDevice *dev);
-int usb_device_attach(USBDevice *dev);
+void usb_device_attach(USBDevice *dev, Error **errp);
 int usb_device_detach(USBDevice *dev);
 int usb_device_delete_addr(int busnr, int addr);
+void usb_check_attach(USBDevice *dev, Error **errp);
 
 static inline USBBus *usb_bus_from_device(USBDevice *d)
 {

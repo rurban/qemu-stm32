@@ -19,7 +19,9 @@
  *
  */
 
+#include "qemu/osdep.h"
 #include "hw/sysbus.h"
+#include "qemu/error-report.h"
 #include "sysemu/sysemu.h"
 #include "sysemu/char.h"
 
@@ -179,7 +181,7 @@ typedef struct Exynos4210UartState {
     Exynos4210UartFIFO   rx;
     Exynos4210UartFIFO   tx;
 
-    CharDriverState  *chr;
+    CharBackend       chr;
     qemu_irq          irq;
 
     uint32_t channel;
@@ -234,10 +236,8 @@ static int fifo_empty_elements_number(Exynos4210UartFIFO *q)
 
 static void fifo_reset(Exynos4210UartFIFO *q)
 {
-    if (q->data != NULL) {
-        g_free(q->data);
-        q->data = NULL;
-    }
+    g_free(q->data);
+    q->data = NULL;
 
     q->data = (uint8_t *)g_malloc0(q->size);
 
@@ -306,7 +306,7 @@ static void exynos4210_uart_update_irq(Exynos4210UartState *s)
 
 static void exynos4210_uart_update_parameters(Exynos4210UartState *s)
 {
-    int speed, parity, data_bits, stop_bits, frame_size;
+    int speed, parity, data_bits, stop_bits;
     QEMUSerialSetParams ssp;
     uint64_t uclk_rate;
 
@@ -314,9 +314,7 @@ static void exynos4210_uart_update_parameters(Exynos4210UartState *s)
         return;
     }
 
-    frame_size = 1; /* start bit */
     if (s->reg[I_(ULCON)] & 0x20) {
-        frame_size++; /* parity bit */
         if (s->reg[I_(ULCON)] & 0x28) {
             parity = 'E';
         } else {
@@ -334,8 +332,6 @@ static void exynos4210_uart_update_parameters(Exynos4210UartState *s)
 
     data_bits = (s->reg[I_(ULCON)] & 0x3) + 5;
 
-    frame_size += data_bits + stop_bits;
-
     uclk_rate = 24000000;
 
     speed = uclk_rate / ((16 * (s->reg[I_(UBRDIV)]) & 0xffff) +
@@ -346,7 +342,7 @@ static void exynos4210_uart_update_parameters(Exynos4210UartState *s)
     ssp.data_bits = data_bits;
     ssp.stop_bits = stop_bits;
 
-    qemu_chr_fe_ioctl(s->chr, CHR_IOCTL_SERIAL_SET_PARAMS, &ssp);
+    qemu_chr_fe_ioctl(&s->chr, CHR_IOCTL_SERIAL_SET_PARAMS, &ssp);
 
     PRINT_DEBUG("UART%d: speed: %d, parity: %c, data: %d, stop: %d\n",
                 s->channel, speed, parity, data_bits, stop_bits);
@@ -383,11 +379,13 @@ static void exynos4210_uart_write(void *opaque, hwaddr offset,
         break;
 
     case UTXH:
-        if (s->chr) {
+        if (qemu_chr_fe_get_driver(&s->chr)) {
             s->reg[I_(UTRSTAT)] &= ~(UTRSTAT_TRANSMITTER_EMPTY |
                     UTRSTAT_Tx_BUFFER_EMPTY);
             ch = (uint8_t)val;
-            qemu_chr_fe_write(s->chr, &ch, 1);
+            /* XXX this blocks entire thread. Rewrite to use
+             * qemu_chr_fe_write and background I/O callbacks */
+            qemu_chr_fe_write_all(&s->chr, &ch, 1);
 #if DEBUG_Tx_DATA
             fprintf(stderr, "%c", ch);
 #endif
@@ -563,7 +561,7 @@ static const VMStateDescription vmstate_exynos4210_uart_fifo = {
     .fields = (VMStateField[]) {
         VMSTATE_UINT32(sp, Exynos4210UartFIFO),
         VMSTATE_UINT32(rp, Exynos4210UartFIFO),
-        VMSTATE_VBUFFER_UINT32(data, Exynos4210UartFIFO, 1, NULL, 0, size),
+        VMSTATE_VBUFFER_UINT32(data, Exynos4210UartFIFO, 1, NULL, size),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -584,7 +582,7 @@ static const VMStateDescription vmstate_exynos4210_uart = {
 DeviceState *exynos4210_uart_create(hwaddr addr,
                                     int fifo_size,
                                     int channel,
-                                    CharDriverState *chr,
+                                    Chardev *chr,
                                     qemu_irq irq)
 {
     DeviceState  *dev;
@@ -597,15 +595,17 @@ DeviceState *exynos4210_uart_create(hwaddr addr,
 
     if (!chr) {
         if (channel >= MAX_SERIAL_PORTS) {
-            hw_error("Only %d serial ports are supported by QEMU.\n",
-                     MAX_SERIAL_PORTS);
+            error_report("Only %d serial ports are supported by QEMU",
+                         MAX_SERIAL_PORTS);
+            exit(1);
         }
         chr = serial_hds[channel];
         if (!chr) {
             snprintf(label, ARRAY_SIZE(label), "%s%d", chr_name, channel);
-            chr = qemu_chr_new(label, "null", NULL);
+            chr = qemu_chr_new(label, "null");
             if (!(chr)) {
-                hw_error("Can't assign serial port to UART%d.\n", channel);
+                error_report("Can't assign serial port to UART%d", channel);
+                exit(1);
             }
         }
     }
@@ -625,21 +625,26 @@ DeviceState *exynos4210_uart_create(hwaddr addr,
     return dev;
 }
 
-static int exynos4210_uart_init(SysBusDevice *dev)
+static void exynos4210_uart_init(Object *obj)
 {
+    SysBusDevice *dev = SYS_BUS_DEVICE(obj);
     Exynos4210UartState *s = EXYNOS4210_UART(dev);
 
     /* memory mapping */
-    memory_region_init_io(&s->iomem, OBJECT(s), &exynos4210_uart_ops, s,
+    memory_region_init_io(&s->iomem, obj, &exynos4210_uart_ops, s,
                           "exynos4210.uart", EXYNOS4210_UART_REGS_MEM_SIZE);
     sysbus_init_mmio(dev, &s->iomem);
 
     sysbus_init_irq(dev, &s->irq);
+}
 
-    qemu_chr_add_handlers(s->chr, exynos4210_uart_can_receive,
-                          exynos4210_uart_receive, exynos4210_uart_event, s);
+static void exynos4210_uart_realize(DeviceState *dev, Error **errp)
+{
+    Exynos4210UartState *s = EXYNOS4210_UART(dev);
 
-    return 0;
+    qemu_chr_fe_set_handlers(&s->chr, exynos4210_uart_can_receive,
+                             exynos4210_uart_receive, exynos4210_uart_event,
+                             s, NULL, true);
 }
 
 static Property exynos4210_uart_properties[] = {
@@ -653,9 +658,8 @@ static Property exynos4210_uart_properties[] = {
 static void exynos4210_uart_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
-    SysBusDeviceClass *k = SYS_BUS_DEVICE_CLASS(klass);
 
-    k->init = exynos4210_uart_init;
+    dc->realize = exynos4210_uart_realize;
     dc->reset = exynos4210_uart_reset;
     dc->props = exynos4210_uart_properties;
     dc->vmsd = &vmstate_exynos4210_uart;
@@ -665,6 +669,7 @@ static const TypeInfo exynos4210_uart_info = {
     .name          = TYPE_EXYNOS4210_UART,
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(Exynos4210UartState),
+    .instance_init = exynos4210_uart_init,
     .class_init    = exynos4210_uart_class_init,
 };
 

@@ -21,6 +21,10 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+#include "qemu/osdep.h"
+#include "qapi/error.h"
+#include "qemu-common.h"
+#include "cpu.h"
 #include "hw/hw.h"
 #include "hw/ppc/ppc.h"
 #include "hw/boards.h"
@@ -974,7 +978,8 @@ static void ppc405_ocm_init(CPUPPCState *env)
 
     ocm = g_malloc0(sizeof(ppc405_ocm_t));
     /* XXX: Size is 4096 or 0x04000000 */
-    memory_region_init_ram(&ocm->isarc_ram, NULL, "ppc405.ocm", 4096);
+    memory_region_init_ram(&ocm->isarc_ram, NULL, "ppc405.ocm", 4096,
+                           &error_fatal);
     vmstate_register_ram_global(&ocm->isarc_ram);
     memory_region_init_alias(&ocm->dsarc_ram, NULL, "ppc405.dsarc", &ocm->isarc_ram,
                              0, 4096);
@@ -1351,7 +1356,7 @@ static uint32_t ppc4xx_gpt_readl (void *opaque, hwaddr addr)
     case 0x00:
         /* Time base counter */
         ret = muldiv64(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + gpt->tb_offset,
-                       gpt->tb_freq, get_ticks_per_sec());
+                       gpt->tb_freq, NANOSECONDS_PER_SECOND);
         break;
     case 0x10:
         /* Output enable */
@@ -1406,7 +1411,7 @@ static void ppc4xx_gpt_writel (void *opaque,
     switch (addr) {
     case 0x00:
         /* Time base counter */
-        gpt->tb_offset = muldiv64(value, get_ticks_per_sec(), gpt->tb_freq)
+        gpt->tb_offset = muldiv64(value, NANOSECONDS_PER_SECOND, gpt->tb_freq)
             - qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         ppc4xx_gpt_compute_timer(gpt);
         break;
@@ -1876,7 +1881,7 @@ static void ppc405cr_clk_setup (ppc405cr_cpc_t *cpc)
         D1 = (((cpc->pllmr >> 20) - 1) & 0xF) + 1; /* FBDV */
         D2 = 8 - ((cpc->pllmr >> 16) & 0x7); /* FWDVA */
         M = D0 * D1 * D2;
-        VCO_out = cpc->sysclk * M;
+        VCO_out = (uint64_t)cpc->sysclk * M;
         if (VCO_out < 400000000 || VCO_out > 800000000) {
             /* PLL cannot lock */
             cpc->pllmr &= ~0x80000000;
@@ -1887,7 +1892,7 @@ static void ppc405cr_clk_setup (ppc405cr_cpc_t *cpc)
         /* Bypass PLL */
     bypass_pll:
         M = D0;
-        PLL_out = cpc->sysclk * M;
+        PLL_out = (uint64_t)cpc->sysclk * M;
     }
     CPU_clk = PLL_out;
     if (cpc->cr1 & 0x00800000)
@@ -2237,7 +2242,7 @@ static void ppc405ep_compute_clocks (ppc405ep_cpc_t *cpc)
 #ifdef DEBUG_CLOCKS_LL
         printf("FWDA %01" PRIx32 " %d\n", (cpc->pllmr[1] >> 16) & 0x7, D);
 #endif
-        VCO_out = cpc->sysclk * M * D;
+        VCO_out = (uint64_t)cpc->sysclk * M * D;
         if (VCO_out < 500000000UL || VCO_out > 1000000000UL) {
             /* Error - unlock the PLL */
             printf("VCO out of range %" PRIu64 "\n", VCO_out);

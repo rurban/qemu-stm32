@@ -22,13 +22,14 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
-#include <hw/hw.h>
-#include <hw/i386/pc.h>
-#include <hw/pcmcia.h>
-#include "block/block.h"
+#include "qemu/osdep.h"
+#include "hw/hw.h"
+#include "hw/i386/pc.h"
+#include "hw/pcmcia.h"
+#include "sysemu/block-backend.h"
 #include "sysemu/dma.h"
 
-#include <hw/ide/internal.h>
+#include "hw/ide/internal.h"
 
 #define TYPE_MICRODRIVE "microdrive"
 #define MICRODRIVE(obj) OBJECT_CHECK(MicroDriveState, (obj), TYPE_MICRODRIVE)
@@ -247,7 +248,7 @@ static uint16_t md_common_read(PCMCIACardState *card, uint32_t at)
         return ide_ioport_read(&s->bus, 0x1);
     case 0xe:	/* Alternate Status */
         ifs = idebus_active_if(&s->bus);
-        if (ifs->bs) {
+        if (ifs->blk) {
             return ifs->status;
         } else {
             return 0;
@@ -543,7 +544,6 @@ static int dscm1xxxx_attach(PCMCIACardState *card)
     device_reset(DEVICE(md));
     md_interrupt_update(md);
 
-    card->slot->card_string = "DSCM-1xxxx Hitachi Microdrive";
     return 0;
 }
 
@@ -567,7 +567,7 @@ PCMCIACardState *dscm1xxxx_init(DriveInfo *dinfo)
     }
     md->bus.ifs[0].drive_kind = IDE_CFATA;
     md->bus.ifs[0].mdata_size = METADATA_SIZE;
-    md->bus.ifs[0].mdata_storage = (uint8_t *) g_malloc0(METADATA_SIZE);
+    md->bus.ifs[0].mdata_storage = g_malloc0(METADATA_SIZE);
 
     return PCMCIA_CARD(md);
 }

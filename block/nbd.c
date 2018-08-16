@@ -26,22 +26,29 @@
  * THE SOFTWARE.
  */
 
+#include "qemu/osdep.h"
 #include "block/nbd-client.h"
+#include "qapi/error.h"
 #include "qemu/uri.h"
 #include "block/block_int.h"
 #include "qemu/module.h"
-#include "qemu/sockets.h"
+#include "qapi-visit.h"
+#include "qapi/qobject-input-visitor.h"
+#include "qapi/qobject-output-visitor.h"
+#include "qapi/qmp/qdict.h"
 #include "qapi/qmp/qjson.h"
 #include "qapi/qmp/qint.h"
-
-#include <sys/types.h>
-#include <unistd.h>
+#include "qapi/qmp/qstring.h"
+#include "qemu/cutils.h"
 
 #define EN_OPTSTR ":exportname="
 
 typedef struct BDRVNBDState {
-    NbdClientSession client;
-    QemuOpts *socket_opts;
+    NBDClientSession client;
+
+    /* For nbd_refresh_filename() */
+    SocketAddressFlat *saddr;
+    char *export, *tlscredsid;
 } BDRVNBDState;
 
 static int nbd_parse_uri(const char *filename, QDict *options)
@@ -58,11 +65,11 @@ static int nbd_parse_uri(const char *filename, QDict *options)
     }
 
     /* transport */
-    if (!strcmp(uri->scheme, "nbd")) {
+    if (!g_strcmp0(uri->scheme, "nbd")) {
         is_unix = false;
-    } else if (!strcmp(uri->scheme, "nbd+tcp")) {
+    } else if (!g_strcmp0(uri->scheme, "nbd+tcp")) {
         is_unix = false;
-    } else if (!strcmp(uri->scheme, "nbd+unix")) {
+    } else if (!g_strcmp0(uri->scheme, "nbd+unix")) {
         is_unix = true;
     } else {
         ret = -EINVAL;
@@ -72,7 +79,7 @@ static int nbd_parse_uri(const char *filename, QDict *options)
     p = uri->path ? uri->path : "/";
     p += strspn(p, "/");
     if (p[0]) {
-        qdict_put(options, "export", qstring_from_str(p));
+        qdict_put_str(options, "export", p);
     }
 
     qp = query_params_parse(uri->query);
@@ -87,9 +94,12 @@ static int nbd_parse_uri(const char *filename, QDict *options)
             ret = -EINVAL;
             goto out;
         }
-        qdict_put(options, "path", qstring_from_str(qp->p[0].value));
+        qdict_put_str(options, "server.type", "unix");
+        qdict_put_str(options, "server.path", qp->p[0].value);
     } else {
         QString *host;
+        char *port_str;
+
         /* nbd[+tcp]://host[:port]/export */
         if (!uri->server) {
             ret = -EINVAL;
@@ -104,12 +114,12 @@ static int nbd_parse_uri(const char *filename, QDict *options)
             host = qstring_from_str(uri->server);
         }
 
-        qdict_put(options, "host", host);
-        if (uri->port) {
-            char* port_str = g_strdup_printf("%d", uri->port);
-            qdict_put(options, "port", qstring_from_str(port_str));
-            g_free(port_str);
-        }
+        qdict_put_str(options, "server.type", "inet");
+        qdict_put(options, "server.host", host);
+
+        port_str = g_strdup_printf("%d", uri->port ?: NBD_DEFAULT_PORT);
+        qdict_put_str(options, "server.port", port_str);
+        g_free(port_str);
     }
 
 out:
@@ -120,6 +130,26 @@ out:
     return ret;
 }
 
+static bool nbd_has_filename_options_conflict(QDict *options, Error **errp)
+{
+    const QDictEntry *e;
+
+    for (e = qdict_first(options); e; e = qdict_next(options, e)) {
+        if (!strcmp(e->key, "host") ||
+            !strcmp(e->key, "port") ||
+            !strcmp(e->key, "path") ||
+            !strcmp(e->key, "export") ||
+            strstart(e->key, "server.", NULL))
+        {
+            error_setg(errp, "Option '%s' cannot be used with a file name",
+                       e->key);
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static void nbd_parse_filename(const char *filename, QDict *options,
                                Error **errp)
 {
@@ -128,12 +158,7 @@ static void nbd_parse_filename(const char *filename, QDict *options,
     const char *host_spec;
     const char *unixpath;
 
-    if (qdict_haskey(options, "host")
-        || qdict_haskey(options, "port")
-        || qdict_haskey(options, "path"))
-    {
-        error_setg(errp, "host/port/path and a file name may not be specified "
-                         "at the same time");
+    if (nbd_has_filename_options_conflict(options, errp)) {
         return;
     }
 
@@ -155,7 +180,7 @@ static void nbd_parse_filename(const char *filename, QDict *options,
         export_name[0] = 0; /* truncate 'file' */
         export_name += strlen(EN_OPTSTR);
 
-        qdict_put(options, "export", qstring_from_str(export_name));
+        qdict_put_str(options, "export", export_name);
     }
 
     /* extract the host_spec - fail if it's not nbd:... */
@@ -170,7 +195,8 @@ static void nbd_parse_filename(const char *filename, QDict *options,
 
     /* are we a UNIX or TCP socket? */
     if (strstart(host_spec, "unix:", &unixpath)) {
-        qdict_put(options, "path", qstring_from_str(unixpath));
+        qdict_put_str(options, "server.type", "unix");
+        qdict_put_str(options, "server.path", unixpath);
     } else {
         InetSocketAddress *addr = NULL;
 
@@ -179,8 +205,9 @@ static void nbd_parse_filename(const char *filename, QDict *options,
             goto out;
         }
 
-        qdict_put(options, "host", qstring_from_str(addr->host));
-        qdict_put(options, "port", qstring_from_str(addr->port));
+        qdict_put_str(options, "server.type", "inet");
+        qdict_put_str(options, "server.host", addr->host);
+        qdict_put_str(options, "server.port", addr->port);
         qapi_free_InetSocketAddress(addr);
     }
 
@@ -188,132 +215,280 @@ out:
     g_free(file);
 }
 
-static void nbd_config(BDRVNBDState *s, QDict *options, char **export,
-                       Error **errp)
+static bool nbd_process_legacy_socket_options(QDict *output_options,
+                                              QemuOpts *legacy_opts,
+                                              Error **errp)
 {
+    const char *path = qemu_opt_get(legacy_opts, "path");
+    const char *host = qemu_opt_get(legacy_opts, "host");
+    const char *port = qemu_opt_get(legacy_opts, "port");
+    const QDictEntry *e;
+
+    if (!path && !host && !port) {
+        return true;
+    }
+
+    for (e = qdict_first(output_options); e; e = qdict_next(output_options, e))
+    {
+        if (strstart(e->key, "server.", NULL)) {
+            error_setg(errp, "Cannot use 'server' and path/host/port at the "
+                       "same time");
+            return false;
+        }
+    }
+
+    if (path && host) {
+        error_setg(errp, "path and host may not be used at the same time");
+        return false;
+    } else if (path) {
+        if (port) {
+            error_setg(errp, "port may not be used without host");
+            return false;
+        }
+
+        qdict_put_str(output_options, "server.type", "unix");
+        qdict_put_str(output_options, "server.path", path);
+    } else if (host) {
+        qdict_put_str(output_options, "server.type", "inet");
+        qdict_put_str(output_options, "server.host", host);
+        qdict_put_str(output_options, "server.port",
+                      port ?: stringify(NBD_DEFAULT_PORT));
+    }
+
+    return true;
+}
+
+static SocketAddressFlat *nbd_config(BDRVNBDState *s, QDict *options,
+                                     Error **errp)
+{
+    SocketAddressFlat *saddr = NULL;
+    QDict *addr = NULL;
+    QObject *crumpled_addr = NULL;
+    Visitor *iv = NULL;
     Error *local_err = NULL;
 
-    if (qdict_haskey(options, "path") == qdict_haskey(options, "host")) {
-        if (qdict_haskey(options, "path")) {
-            error_setg(errp, "path and host may not be used at the same time.");
-        } else {
-            error_setg(errp, "one of path and host must be specified.");
-        }
-        return;
+    qdict_extract_subqdict(options, &addr, "server.");
+    if (!qdict_size(addr)) {
+        error_setg(errp, "NBD server address missing");
+        goto done;
     }
 
-    s->client.is_unix = qdict_haskey(options, "path");
-    s->socket_opts = qemu_opts_create(&socket_optslist, NULL, 0,
-                                      &error_abort);
+    crumpled_addr = qdict_crumple(addr, errp);
+    if (!crumpled_addr) {
+        goto done;
+    }
 
-    qemu_opts_absorb_qdict(s->socket_opts, options, &local_err);
+    /*
+     * FIXME .numeric, .to, .ipv4 or .ipv6 don't work with -drive
+     * server.type=inet.  .to doesn't matter, it's ignored anyway.
+     * That's because when @options come from -blockdev or
+     * blockdev_add, members are typed according to the QAPI schema,
+     * but when they come from -drive, they're all QString.  The
+     * visitor expects the former.
+     */
+    iv = qobject_input_visitor_new(crumpled_addr);
+    visit_type_SocketAddressFlat(iv, NULL, &saddr, &local_err);
     if (local_err) {
         error_propagate(errp, local_err);
-        return;
+        goto done;
     }
 
-    if (!qemu_opt_get(s->socket_opts, "port")) {
-        qemu_opt_set_number(s->socket_opts, "port", NBD_DEFAULT_PORT);
-    }
-
-    *export = g_strdup(qdict_get_try_str(options, "export"));
-    if (*export) {
-        qdict_del(options, "export");
-    }
+done:
+    QDECREF(addr);
+    qobject_decref(crumpled_addr);
+    visit_free(iv);
+    return saddr;
 }
 
-static int nbd_establish_connection(BlockDriverState *bs, Error **errp)
+NBDClientSession *nbd_get_client_session(BlockDriverState *bs)
 {
     BDRVNBDState *s = bs->opaque;
-    int sock;
-
-    if (s->client.is_unix) {
-        sock = unix_connect_opts(s->socket_opts, errp, NULL, NULL);
-    } else {
-        sock = inet_connect_opts(s->socket_opts, errp, NULL, NULL);
-        if (sock >= 0) {
-            socket_set_nodelay(sock);
-        }
-    }
-
-    /* Failed to establish connection */
-    if (sock < 0) {
-        logout("Failed to establish connection to NBD server\n");
-        return -errno;
-    }
-
-    return sock;
+    return &s->client;
 }
+
+static QIOChannelSocket *nbd_establish_connection(SocketAddressFlat *saddr_flat,
+                                                  Error **errp)
+{
+    SocketAddress *saddr = socket_address_crumple(saddr_flat);
+    QIOChannelSocket *sioc;
+    Error *local_err = NULL;
+
+    sioc = qio_channel_socket_new();
+    qio_channel_set_name(QIO_CHANNEL(sioc), "nbd-client");
+
+    qio_channel_socket_connect_sync(sioc,
+                                    saddr,
+                                    &local_err);
+    qapi_free_SocketAddress(saddr);
+    if (local_err) {
+        object_unref(OBJECT(sioc));
+        error_propagate(errp, local_err);
+        return NULL;
+    }
+
+    qio_channel_set_delay(QIO_CHANNEL(sioc), false);
+
+    return sioc;
+}
+
+
+static QCryptoTLSCreds *nbd_get_tls_creds(const char *id, Error **errp)
+{
+    Object *obj;
+    QCryptoTLSCreds *creds;
+
+    obj = object_resolve_path_component(
+        object_get_objects_root(), id);
+    if (!obj) {
+        error_setg(errp, "No TLS credentials with id '%s'",
+                   id);
+        return NULL;
+    }
+    creds = (QCryptoTLSCreds *)
+        object_dynamic_cast(obj, TYPE_QCRYPTO_TLS_CREDS);
+    if (!creds) {
+        error_setg(errp, "Object with id '%s' is not TLS credentials",
+                   id);
+        return NULL;
+    }
+
+    if (creds->endpoint != QCRYPTO_TLS_CREDS_ENDPOINT_CLIENT) {
+        error_setg(errp,
+                   "Expecting TLS credentials with a client endpoint");
+        return NULL;
+    }
+    object_ref(obj);
+    return creds;
+}
+
+
+static QemuOptsList nbd_runtime_opts = {
+    .name = "nbd",
+    .head = QTAILQ_HEAD_INITIALIZER(nbd_runtime_opts.head),
+    .desc = {
+        {
+            .name = "host",
+            .type = QEMU_OPT_STRING,
+            .help = "TCP host to connect to",
+        },
+        {
+            .name = "port",
+            .type = QEMU_OPT_STRING,
+            .help = "TCP port to connect to",
+        },
+        {
+            .name = "path",
+            .type = QEMU_OPT_STRING,
+            .help = "Unix socket path to connect to",
+        },
+        {
+            .name = "export",
+            .type = QEMU_OPT_STRING,
+            .help = "Name of the NBD export to open",
+        },
+        {
+            .name = "tls-creds",
+            .type = QEMU_OPT_STRING,
+            .help = "ID of the TLS credentials to use",
+        },
+    },
+};
 
 static int nbd_open(BlockDriverState *bs, QDict *options, int flags,
                     Error **errp)
 {
     BDRVNBDState *s = bs->opaque;
-    char *export = NULL;
-    int result, sock;
+    QemuOpts *opts = NULL;
     Error *local_err = NULL;
+    QIOChannelSocket *sioc = NULL;
+    QCryptoTLSCreds *tlscreds = NULL;
+    const char *hostname = NULL;
+    int ret = -EINVAL;
 
-    /* Pop the config into our state object. Exit if invalid. */
-    nbd_config(s, options, &export, &local_err);
+    opts = qemu_opts_create(&nbd_runtime_opts, NULL, 0, &error_abort);
+    qemu_opts_absorb_qdict(opts, options, &local_err);
     if (local_err) {
         error_propagate(errp, local_err);
-        return -EINVAL;
+        goto error;
+    }
+
+    /* Translate @host, @port, and @path to a SocketAddressFlat */
+    if (!nbd_process_legacy_socket_options(options, opts, errp)) {
+        goto error;
+    }
+
+    /* Pop the config into our state object. Exit if invalid. */
+    s->saddr = nbd_config(s, options, errp);
+    if (!s->saddr) {
+        goto error;
+    }
+
+    s->export = g_strdup(qemu_opt_get(opts, "export"));
+
+    s->tlscredsid = g_strdup(qemu_opt_get(opts, "tls-creds"));
+    if (s->tlscredsid) {
+        tlscreds = nbd_get_tls_creds(s->tlscredsid, errp);
+        if (!tlscreds) {
+            goto error;
+        }
+
+        /* TODO SOCKET_ADDRESS_KIND_FD where fd has AF_INET or AF_INET6 */
+        if (s->saddr->type != SOCKET_ADDRESS_FLAT_TYPE_INET) {
+            error_setg(errp, "TLS only supported over IP sockets");
+            goto error;
+        }
+        hostname = s->saddr->u.inet.host;
     }
 
     /* establish TCP connection, return error if it fails
      * TODO: Configurable retry-until-timeout behaviour.
      */
-    sock = nbd_establish_connection(bs, errp);
-    if (sock < 0) {
-        return sock;
+    sioc = nbd_establish_connection(s->saddr, errp);
+    if (!sioc) {
+        ret = -ECONNREFUSED;
+        goto error;
     }
 
     /* NBD handshake */
-    result = nbd_client_session_init(&s->client, bs, sock, export);
-    g_free(export);
-    return result;
-}
-
-static int nbd_co_readv(BlockDriverState *bs, int64_t sector_num,
-                        int nb_sectors, QEMUIOVector *qiov)
-{
-    BDRVNBDState *s = bs->opaque;
-
-    return nbd_client_session_co_readv(&s->client, sector_num,
-                                       nb_sectors, qiov);
-}
-
-static int nbd_co_writev(BlockDriverState *bs, int64_t sector_num,
-                         int nb_sectors, QEMUIOVector *qiov)
-{
-    BDRVNBDState *s = bs->opaque;
-
-    return nbd_client_session_co_writev(&s->client, sector_num,
-                                        nb_sectors, qiov);
+    ret = nbd_client_init(bs, sioc, s->export,
+                          tlscreds, hostname, errp);
+ error:
+    if (sioc) {
+        object_unref(OBJECT(sioc));
+    }
+    if (tlscreds) {
+        object_unref(OBJECT(tlscreds));
+    }
+    if (ret < 0) {
+        qapi_free_SocketAddressFlat(s->saddr);
+        g_free(s->export);
+        g_free(s->tlscredsid);
+    }
+    qemu_opts_del(opts);
+    return ret;
 }
 
 static int nbd_co_flush(BlockDriverState *bs)
 {
-    BDRVNBDState *s = bs->opaque;
-
-    return nbd_client_session_co_flush(&s->client);
+    return nbd_client_co_flush(bs);
 }
 
-static int nbd_co_discard(BlockDriverState *bs, int64_t sector_num,
-                          int nb_sectors)
+static void nbd_refresh_limits(BlockDriverState *bs, Error **errp)
 {
-    BDRVNBDState *s = bs->opaque;
-
-    return nbd_client_session_co_discard(&s->client, sector_num,
-                                         nb_sectors);
+    bs->bl.max_pdiscard = NBD_MAX_BUFFER_SIZE;
+    bs->bl.max_pwrite_zeroes = NBD_MAX_BUFFER_SIZE;
+    bs->bl.max_transfer = NBD_MAX_BUFFER_SIZE;
 }
 
 static void nbd_close(BlockDriverState *bs)
 {
     BDRVNBDState *s = bs->opaque;
 
-    qemu_opts_del(s->socket_opts);
-    nbd_client_session_close(&s->client);
+    nbd_client_close(bs);
+
+    qapi_free_SocketAddressFlat(s->saddr);
+    g_free(s->export);
+    g_free(s->tlscredsid);
 }
 
 static int64_t nbd_getlength(BlockDriverState *bs)
@@ -325,17 +500,64 @@ static int64_t nbd_getlength(BlockDriverState *bs)
 
 static void nbd_detach_aio_context(BlockDriverState *bs)
 {
-    BDRVNBDState *s = bs->opaque;
-
-    nbd_client_session_detach_aio_context(&s->client);
+    nbd_client_detach_aio_context(bs);
 }
 
 static void nbd_attach_aio_context(BlockDriverState *bs,
                                    AioContext *new_context)
 {
-    BDRVNBDState *s = bs->opaque;
+    nbd_client_attach_aio_context(bs, new_context);
+}
 
-    nbd_client_session_attach_aio_context(&s->client, new_context);
+static void nbd_refresh_filename(BlockDriverState *bs, QDict *options)
+{
+    BDRVNBDState *s = bs->opaque;
+    QDict *opts = qdict_new();
+    QObject *saddr_qdict;
+    Visitor *ov;
+    const char *host = NULL, *port = NULL, *path = NULL;
+
+    if (s->saddr->type == SOCKET_ADDRESS_FLAT_TYPE_INET) {
+        const InetSocketAddress *inet = &s->saddr->u.inet;
+        if (!inet->has_ipv4 && !inet->has_ipv6 && !inet->has_to) {
+            host = inet->host;
+            port = inet->port;
+        }
+    } else if (s->saddr->type == SOCKET_ADDRESS_FLAT_TYPE_UNIX) {
+        path = s->saddr->u.q_unix.path;
+    } /* else can't represent as pseudo-filename */
+
+    qdict_put_str(opts, "driver", "nbd");
+
+    if (path && s->export) {
+        snprintf(bs->exact_filename, sizeof(bs->exact_filename),
+                 "nbd+unix:///%s?socket=%s", s->export, path);
+    } else if (path && !s->export) {
+        snprintf(bs->exact_filename, sizeof(bs->exact_filename),
+                 "nbd+unix://?socket=%s", path);
+    } else if (host && s->export) {
+        snprintf(bs->exact_filename, sizeof(bs->exact_filename),
+                 "nbd://%s:%s/%s", host, port, s->export);
+    } else if (host && !s->export) {
+        snprintf(bs->exact_filename, sizeof(bs->exact_filename),
+                 "nbd://%s:%s", host, port);
+    }
+
+    ov = qobject_output_visitor_new(&saddr_qdict);
+    visit_type_SocketAddressFlat(ov, NULL, &s->saddr, &error_abort);
+    visit_complete(ov, &saddr_qdict);
+    visit_free(ov);
+    qdict_put_obj(opts, "server", saddr_qdict);
+
+    if (s->export) {
+        qdict_put_str(opts, "export", s->export);
+    }
+    if (s->tlscredsid) {
+        qdict_put_str(opts, "tls-creds", s->tlscredsid);
+    }
+
+    qdict_flatten(opts);
+    bs->full_open_options = opts;
 }
 
 static BlockDriver bdrv_nbd = {
@@ -344,14 +566,17 @@ static BlockDriver bdrv_nbd = {
     .instance_size              = sizeof(BDRVNBDState),
     .bdrv_parse_filename        = nbd_parse_filename,
     .bdrv_file_open             = nbd_open,
-    .bdrv_co_readv              = nbd_co_readv,
-    .bdrv_co_writev             = nbd_co_writev,
+    .bdrv_co_preadv             = nbd_client_co_preadv,
+    .bdrv_co_pwritev            = nbd_client_co_pwritev,
+    .bdrv_co_pwrite_zeroes      = nbd_client_co_pwrite_zeroes,
     .bdrv_close                 = nbd_close,
     .bdrv_co_flush_to_os        = nbd_co_flush,
-    .bdrv_co_discard            = nbd_co_discard,
+    .bdrv_co_pdiscard           = nbd_client_co_pdiscard,
+    .bdrv_refresh_limits        = nbd_refresh_limits,
     .bdrv_getlength             = nbd_getlength,
     .bdrv_detach_aio_context    = nbd_detach_aio_context,
     .bdrv_attach_aio_context    = nbd_attach_aio_context,
+    .bdrv_refresh_filename      = nbd_refresh_filename,
 };
 
 static BlockDriver bdrv_nbd_tcp = {
@@ -360,14 +585,17 @@ static BlockDriver bdrv_nbd_tcp = {
     .instance_size              = sizeof(BDRVNBDState),
     .bdrv_parse_filename        = nbd_parse_filename,
     .bdrv_file_open             = nbd_open,
-    .bdrv_co_readv              = nbd_co_readv,
-    .bdrv_co_writev             = nbd_co_writev,
+    .bdrv_co_preadv             = nbd_client_co_preadv,
+    .bdrv_co_pwritev            = nbd_client_co_pwritev,
+    .bdrv_co_pwrite_zeroes      = nbd_client_co_pwrite_zeroes,
     .bdrv_close                 = nbd_close,
     .bdrv_co_flush_to_os        = nbd_co_flush,
-    .bdrv_co_discard            = nbd_co_discard,
+    .bdrv_co_pdiscard           = nbd_client_co_pdiscard,
+    .bdrv_refresh_limits        = nbd_refresh_limits,
     .bdrv_getlength             = nbd_getlength,
     .bdrv_detach_aio_context    = nbd_detach_aio_context,
     .bdrv_attach_aio_context    = nbd_attach_aio_context,
+    .bdrv_refresh_filename      = nbd_refresh_filename,
 };
 
 static BlockDriver bdrv_nbd_unix = {
@@ -376,14 +604,17 @@ static BlockDriver bdrv_nbd_unix = {
     .instance_size              = sizeof(BDRVNBDState),
     .bdrv_parse_filename        = nbd_parse_filename,
     .bdrv_file_open             = nbd_open,
-    .bdrv_co_readv              = nbd_co_readv,
-    .bdrv_co_writev             = nbd_co_writev,
+    .bdrv_co_preadv             = nbd_client_co_preadv,
+    .bdrv_co_pwritev            = nbd_client_co_pwritev,
+    .bdrv_co_pwrite_zeroes      = nbd_client_co_pwrite_zeroes,
     .bdrv_close                 = nbd_close,
     .bdrv_co_flush_to_os        = nbd_co_flush,
-    .bdrv_co_discard            = nbd_co_discard,
+    .bdrv_co_pdiscard           = nbd_client_co_pdiscard,
+    .bdrv_refresh_limits        = nbd_refresh_limits,
     .bdrv_getlength             = nbd_getlength,
     .bdrv_detach_aio_context    = nbd_detach_aio_context,
     .bdrv_attach_aio_context    = nbd_attach_aio_context,
+    .bdrv_refresh_filename      = nbd_refresh_filename,
 };
 
 static void bdrv_nbd_init(void)

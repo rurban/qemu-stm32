@@ -22,15 +22,9 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+#include "qemu/osdep.h"
 #include <windows.h>
 #include <mmsystem.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <signal.h>
-#include <time.h>
-#include <errno.h>
-#include <sys/time.h>
-#include "config-host.h"
 #include "sysemu/sysemu.h"
 #include "qemu-options.h"
 
@@ -102,11 +96,6 @@ void os_set_line_buffering(void)
 void os_parse_cmd_args(int index, const char *optarg)
 {
     return;
-}
-
-void os_pidfile_error(void)
-{
-    fprintf(stderr, "Could not acquire pid file: %s\n", strerror(errno));
 }
 
 int qemu_create_pidfile(const char *filename)

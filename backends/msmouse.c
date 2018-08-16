@@ -21,20 +21,60 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
-#include <stdlib.h>
+#include "qemu/osdep.h"
 #include "qemu-common.h"
 #include "sysemu/char.h"
 #include "ui/console.h"
+#include "ui/input.h"
 
 #define MSMOUSE_LO6(n) ((n) & 0x3f)
 #define MSMOUSE_HI2(n) (((n) & 0xc0) >> 6)
 
-static void msmouse_event(void *opaque,
-                          int dx, int dy, int dz, int buttons_state)
-{
-    CharDriverState *chr = (CharDriverState *)opaque;
+typedef struct {
+    Chardev parent;
 
+    QemuInputHandlerState *hs;
+    int axis[INPUT_AXIS__MAX];
+    bool btns[INPUT_BUTTON__MAX];
+    bool btnc[INPUT_BUTTON__MAX];
+    uint8_t outbuf[32];
+    int outlen;
+} MouseChardev;
+
+#define TYPE_CHARDEV_MSMOUSE "chardev-msmouse"
+#define MOUSE_CHARDEV(obj)                                      \
+    OBJECT_CHECK(MouseChardev, (obj), TYPE_CHARDEV_MSMOUSE)
+
+static void msmouse_chr_accept_input(Chardev *chr)
+{
+    MouseChardev *mouse = MOUSE_CHARDEV(chr);
+    int len;
+
+    len = qemu_chr_be_can_write(chr);
+    if (len > mouse->outlen) {
+        len = mouse->outlen;
+    }
+    if (!len) {
+        return;
+    }
+
+    qemu_chr_be_write(chr, mouse->outbuf, len);
+    mouse->outlen -= len;
+    if (mouse->outlen) {
+        memmove(mouse->outbuf, mouse->outbuf + len, mouse->outlen);
+    }
+}
+
+static void msmouse_queue_event(MouseChardev *mouse)
+{
     unsigned char bytes[4] = { 0x40, 0x00, 0x00, 0x00 };
+    int dx, dy, count = 3;
+
+    dx = mouse->axis[INPUT_AXIS_X];
+    mouse->axis[INPUT_AXIS_X] = 0;
+
+    dy = mouse->axis[INPUT_AXIS_Y];
+    mouse->axis[INPUT_AXIS_Y] = 0;
 
     /* Movement deltas */
     bytes[0] |= (MSMOUSE_HI2(dy) << 2) | MSMOUSE_HI2(dx);
@@ -42,44 +82,109 @@ static void msmouse_event(void *opaque,
     bytes[2] |= MSMOUSE_LO6(dy);
 
     /* Buttons */
-    bytes[0] |= (buttons_state & 0x01 ? 0x20 : 0x00);
-    bytes[0] |= (buttons_state & 0x02 ? 0x10 : 0x00);
-    bytes[3] |= (buttons_state & 0x04 ? 0x20 : 0x00);
+    bytes[0] |= (mouse->btns[INPUT_BUTTON_LEFT]   ? 0x20 : 0x00);
+    bytes[0] |= (mouse->btns[INPUT_BUTTON_RIGHT]  ? 0x10 : 0x00);
+    if (mouse->btns[INPUT_BUTTON_MIDDLE] ||
+        mouse->btnc[INPUT_BUTTON_MIDDLE]) {
+        bytes[3] |= (mouse->btns[INPUT_BUTTON_MIDDLE] ? 0x20 : 0x00);
+        mouse->btnc[INPUT_BUTTON_MIDDLE] = false;
+        count = 4;
+    }
 
-    /* We always send the packet of, so that we do not have to keep track
-       of previous state of the middle button. This can potentially confuse
-       some very old drivers for two button mice though. */
-    qemu_chr_be_write(chr, bytes, 4);
+    if (mouse->outlen <= sizeof(mouse->outbuf) - count) {
+        memcpy(mouse->outbuf + mouse->outlen, bytes, count);
+        mouse->outlen += count;
+    } else {
+        /* queue full -> drop event */
+    }
 }
 
-static int msmouse_chr_write (struct CharDriverState *s, const uint8_t *buf, int len)
+static void msmouse_input_event(DeviceState *dev, QemuConsole *src,
+                                InputEvent *evt)
+{
+    MouseChardev *mouse = MOUSE_CHARDEV(dev);
+    InputMoveEvent *move;
+    InputBtnEvent *btn;
+
+    switch (evt->type) {
+    case INPUT_EVENT_KIND_REL:
+        move = evt->u.rel.data;
+        mouse->axis[move->axis] += move->value;
+        break;
+
+    case INPUT_EVENT_KIND_BTN:
+        btn = evt->u.btn.data;
+        mouse->btns[btn->button] = btn->down;
+        mouse->btnc[btn->button] = true;
+        break;
+
+    default:
+        /* keep gcc happy */
+        break;
+    }
+}
+
+static void msmouse_input_sync(DeviceState *dev)
+{
+    MouseChardev *mouse = MOUSE_CHARDEV(dev);
+    Chardev *chr = CHARDEV(dev);
+
+    msmouse_queue_event(mouse);
+    msmouse_chr_accept_input(chr);
+}
+
+static int msmouse_chr_write(struct Chardev *s, const uint8_t *buf, int len)
 {
     /* Ignore writes to mouse port */
     return len;
 }
 
-static void msmouse_chr_close (struct CharDriverState *chr)
+static void char_msmouse_finalize(Object *obj)
 {
-    g_free (chr);
+    MouseChardev *mouse = MOUSE_CHARDEV(obj);
+
+    qemu_input_handler_unregister(mouse->hs);
 }
 
-CharDriverState *qemu_chr_open_msmouse(void)
+static QemuInputHandler msmouse_handler = {
+    .name  = "QEMU Microsoft Mouse",
+    .mask  = INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_REL,
+    .event = msmouse_input_event,
+    .sync  = msmouse_input_sync,
+};
+
+static void msmouse_chr_open(Chardev *chr,
+                             ChardevBackend *backend,
+                             bool *be_opened,
+                             Error **errp)
 {
-    CharDriverState *chr;
+    MouseChardev *mouse = MOUSE_CHARDEV(chr);
 
-    chr = qemu_chr_alloc();
-    chr->chr_write = msmouse_chr_write;
-    chr->chr_close = msmouse_chr_close;
-    chr->explicit_be_open = true;
-
-    qemu_add_mouse_event_handler(msmouse_event, chr, 0, "QEMU Microsoft Mouse");
-
-    return chr;
+    *be_opened = false;
+    mouse->hs = qemu_input_handler_register((DeviceState *)mouse,
+                                            &msmouse_handler);
 }
+
+static void char_msmouse_class_init(ObjectClass *oc, void *data)
+{
+    ChardevClass *cc = CHARDEV_CLASS(oc);
+
+    cc->open = msmouse_chr_open;
+    cc->chr_write = msmouse_chr_write;
+    cc->chr_accept_input = msmouse_chr_accept_input;
+}
+
+static const TypeInfo char_msmouse_type_info = {
+    .name = TYPE_CHARDEV_MSMOUSE,
+    .parent = TYPE_CHARDEV,
+    .instance_size = sizeof(MouseChardev),
+    .instance_finalize = char_msmouse_finalize,
+    .class_init = char_msmouse_class_init,
+};
 
 static void register_types(void)
 {
-    register_char_driver_qapi("msmouse", CHARDEV_BACKEND_KIND_MSMOUSE, NULL);
+    type_register_static(&char_msmouse_type_info);
 }
 
 type_init(register_types);

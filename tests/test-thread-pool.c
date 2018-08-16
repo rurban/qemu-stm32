@@ -1,16 +1,19 @@
-#include <glib.h>
+#include "qemu/osdep.h"
 #include "qemu-common.h"
 #include "block/aio.h"
 #include "block/thread-pool.h"
 #include "block/block.h"
+#include "qapi/error.h"
 #include "qemu/timer.h"
+#include "qemu/error-report.h"
+#include "qemu/main-loop.h"
 
 static AioContext *ctx;
 static ThreadPool *pool;
 static int active;
 
 typedef struct {
-    BlockDriverAIOCB *aiocb;
+    BlockAIOCB *aiocb;
     int n;
     int ret;
 } WorkerTestData;
@@ -33,7 +36,7 @@ static int long_cb(void *opaque)
 static void done_cb(void *opaque, int ret)
 {
     WorkerTestData *data = opaque;
-    g_assert_cmpint(data->ret, ==, -EINPROGRESS);
+    g_assert(data->ret == -EINPROGRESS || data->ret == -ECANCELED);
     data->ret = ret;
     data->aiocb = NULL;
 
@@ -89,9 +92,9 @@ static void co_test_cb(void *opaque)
 static void test_submit_co(void)
 {
     WorkerTestData data;
-    Coroutine *co = qemu_coroutine_create(co_test_cb);
+    Coroutine *co = qemu_coroutine_create(co_test_cb, &data);
 
-    qemu_coroutine_enter(co, &data);
+    qemu_coroutine_enter(co);
 
     /* Back here once the worker has started.  */
 
@@ -132,7 +135,7 @@ static void test_submit_many(void)
     }
 }
 
-static void test_cancel(void)
+static void do_test_cancel(bool sync)
 {
     WorkerTestData data[100];
     int num_canceled;
@@ -170,18 +173,25 @@ static void test_cancel(void)
     for (i = 0; i < 100; i++) {
         if (atomic_cmpxchg(&data[i].n, 0, 3) == 0) {
             data[i].ret = -ECANCELED;
-            bdrv_aio_cancel(data[i].aiocb);
-            active--;
+            if (sync) {
+                bdrv_aio_cancel(data[i].aiocb);
+            } else {
+                bdrv_aio_cancel_async(data[i].aiocb);
+            }
             num_canceled++;
         }
     }
     g_assert_cmpint(active, >, 0);
     g_assert_cmpint(num_canceled, <, 100);
 
-    /* Canceling the others will be a blocking operation.  */
     for (i = 0; i < 100; i++) {
         if (data[i].aiocb && data[i].n != 3) {
-            bdrv_aio_cancel(data[i].aiocb);
+            if (sync) {
+                /* Canceling the others will be a blocking operation.  */
+                bdrv_aio_cancel(data[i].aiocb);
+            } else {
+                bdrv_aio_cancel_async(data[i].aiocb);
+            }
         }
     }
 
@@ -193,22 +203,31 @@ static void test_cancel(void)
     for (i = 0; i < 100; i++) {
         if (data[i].n == 3) {
             g_assert_cmpint(data[i].ret, ==, -ECANCELED);
-            g_assert(data[i].aiocb != NULL);
+            g_assert(data[i].aiocb == NULL);
         } else {
             g_assert_cmpint(data[i].n, ==, 2);
-            g_assert_cmpint(data[i].ret, ==, 0);
+            g_assert(data[i].ret == 0 || data[i].ret == -ECANCELED);
             g_assert(data[i].aiocb == NULL);
         }
     }
+}
+
+static void test_cancel(void)
+{
+    do_test_cancel(true);
+}
+
+static void test_cancel_async(void)
+{
+    do_test_cancel(false);
 }
 
 int main(int argc, char **argv)
 {
     int ret;
 
-    init_clocks();
-
-    ctx = aio_context_new();
+    qemu_init_main_loop(&error_abort);
+    ctx = qemu_get_current_aio_context();
     pool = aio_get_thread_pool(ctx);
 
     g_test_init(&argc, &argv, NULL);
@@ -217,9 +236,9 @@ int main(int argc, char **argv)
     g_test_add_func("/thread-pool/submit-co", test_submit_co);
     g_test_add_func("/thread-pool/submit-many", test_submit_many);
     g_test_add_func("/thread-pool/cancel", test_cancel);
+    g_test_add_func("/thread-pool/cancel-async", test_cancel_async);
 
     ret = g_test_run();
 
-    aio_context_unref(ctx);
     return ret;
 }

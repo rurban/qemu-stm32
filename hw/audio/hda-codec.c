@@ -17,6 +17,7 @@
  * along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#include "qemu/osdep.h"
 #include "hw/hw.h"
 #include "hw/pci/pci.h"
 #include "intel-hda.h"
@@ -489,8 +490,9 @@ static int hda_audio_init(HDACodecDevice *hda, const struct desc_codec *desc)
     for (i = 0; i < a->desc->nnodes; i++) {
         node = a->desc->nodes + i;
         param = hda_codec_find_param(node, AC_PAR_AUDIO_WIDGET_CAP);
-        if (NULL == param)
+        if (param == NULL) {
             continue;
+        }
         type = (param->val & AC_WCAP_TYPE) >> AC_WCAP_TYPE_SHIFT;
         switch (type) {
         case AC_WID_AUD_OUT:

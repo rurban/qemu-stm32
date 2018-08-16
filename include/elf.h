@@ -1,7 +1,5 @@
-#ifndef _QEMU_ELF_H
-#define _QEMU_ELF_H
-
-#include <inttypes.h>
+#ifndef QEMU_ELF_H
+#define QEMU_ELF_H
 
 /* 32-bit ELF base types. */
 typedef uint32_t Elf32_Addr;
@@ -54,6 +52,8 @@ typedef int64_t  Elf64_Sxword;
 #define EF_MIPS_OPTIONS_FIRST	0x00000080
 #define EF_MIPS_32BITMODE	0x00000100
 #define EF_MIPS_ABI		0x0000f000
+#define EF_MIPS_FP64      0x00000200
+#define EF_MIPS_NAN2008   0x00000400
 #define EF_MIPS_ARCH      0xf0000000
 
 /* These constants define the different elf file types */
@@ -92,6 +92,8 @@ typedef int64_t  Elf64_Sxword;
 
 #define EM_SPARCV9     43	/* SPARC v9 64-bit */
 
+#define EM_TRICORE      44      /* Infineon TriCore */
+
 #define EM_IA_64	50	/* HP/Intel IA-64 */
 
 #define EM_X86_64	62	/* AMD x86-64 */
@@ -124,12 +126,19 @@ typedef int64_t  Elf64_Sxword;
  */
 #define EM_S390_OLD     0xA390
 
+#define EM_ALTERA_NIOS2 113     /* Altera Nios II soft-core processor */
+
 #define EM_MICROBLAZE      189
 #define EM_MICROBLAZE_OLD  0xBAAB
 
 #define EM_XTENSA   94      /* Tensilica Xtensa */
 
 #define EM_AARCH64  183
+
+#define EM_TILEGX   191 /* TILE-Gx */
+
+#define EM_MOXIE           223     /* Moxie processor family */
+#define EM_MOXIE_OLD       0xFEED
 
 /* This is the info that is needed to parse the dynamic section of the file */
 #define DT_NULL		0
@@ -471,14 +480,48 @@ typedef struct {
 #define PPC_FEATURE_TRUE_LE             0x00000002
 #define PPC_FEATURE_PPC_LE              0x00000001
 
-/* Bits present in AT_HWCAP, primarily for Sparc32.  */
+/* Bits present in AT_HWCAP2 for PowerPC.  */
 
-#define HWCAP_SPARC_FLUSH       1    /* CPU supports flush instruction. */
-#define HWCAP_SPARC_STBAR       2
-#define HWCAP_SPARC_SWAP        4
-#define HWCAP_SPARC_MULDIV      8
-#define HWCAP_SPARC_V9		16
-#define HWCAP_SPARC_ULTRA3	32
+#define PPC_FEATURE2_ARCH_2_07          0x80000000
+#define PPC_FEATURE2_HAS_HTM            0x40000000
+#define PPC_FEATURE2_HAS_DSCR           0x20000000
+#define PPC_FEATURE2_HAS_EBB            0x10000000
+#define PPC_FEATURE2_HAS_ISEL           0x08000000
+#define PPC_FEATURE2_HAS_TAR            0x04000000
+#define PPC_FEATURE2_HAS_VEC_CRYPTO     0x02000000
+#define PPC_FEATURE2_HTM_NOSC           0x01000000
+#define PPC_FEATURE2_ARCH_3_00          0x00800000
+#define PPC_FEATURE2_HAS_IEEE128        0x00400000
+
+/* Bits present in AT_HWCAP for Sparc.  */
+
+#define HWCAP_SPARC_FLUSH               0x00000001
+#define HWCAP_SPARC_STBAR               0x00000002
+#define HWCAP_SPARC_SWAP                0x00000004
+#define HWCAP_SPARC_MULDIV              0x00000008
+#define HWCAP_SPARC_V9                  0x00000010
+#define HWCAP_SPARC_ULTRA3              0x00000020
+#define HWCAP_SPARC_BLKINIT             0x00000040
+#define HWCAP_SPARC_N2                  0x00000080
+#define HWCAP_SPARC_MUL32               0x00000100
+#define HWCAP_SPARC_DIV32               0x00000200
+#define HWCAP_SPARC_FSMULD              0x00000400
+#define HWCAP_SPARC_V8PLUS              0x00000800
+#define HWCAP_SPARC_POPC                0x00001000
+#define HWCAP_SPARC_VIS                 0x00002000
+#define HWCAP_SPARC_VIS2                0x00004000
+#define HWCAP_SPARC_ASI_BLK_INIT        0x00008000
+#define HWCAP_SPARC_FMAF                0x00010000
+#define HWCAP_SPARC_VIS3                0x00020000
+#define HWCAP_SPARC_HPC                 0x00040000
+#define HWCAP_SPARC_RANDOM              0x00080000
+#define HWCAP_SPARC_TRANS               0x00100000
+#define HWCAP_SPARC_FJFMAU              0x00200000
+#define HWCAP_SPARC_IMA                 0x00400000
+#define HWCAP_SPARC_ASI_CACHE_SPARING   0x00800000
+#define HWCAP_SPARC_PAUSE               0x01000000
+#define HWCAP_SPARC_CBCOND              0x02000000
+#define HWCAP_SPARC_CRYPTO              0x04000000
 
 /* Bits present in AT_HWCAP for s390.  */
 
@@ -1433,6 +1476,8 @@ typedef struct elf64_shdr {
 #define NT_TASKSTRUCT	4
 #define NT_AUXV		6
 #define NT_PRXFPREG     0x46e62b7f      /* copied from gdb5.1/include/elf/common.h */
+#define NT_S390_VXRS_HIGH 0x30a         /* s390 vector registers 16-31 */
+#define NT_S390_VXRS_LOW  0x309         /* s390 vector registers 0-15 (lower half) */
 #define NT_S390_PREFIX  0x305           /* s390 prefix register */
 #define NT_S390_CTRS    0x304           /* s390 control registers */
 #define NT_S390_TODPREG 0x303           /* s390 TOD programmable register */
@@ -1441,6 +1486,11 @@ typedef struct elf64_shdr {
 #define NT_PPC_VMX       0x100          /* PowerPC Altivec/VMX registers */
 #define NT_PPC_SPE       0x101          /* PowerPC SPE/EVR registers */
 #define NT_PPC_VSX       0x102          /* PowerPC VSX registers */
+#define NT_ARM_VFP      0x400           /* ARM VFP/NEON registers */
+#define NT_ARM_TLS      0x401           /* ARM TLS register */
+#define NT_ARM_HW_BREAK 0x402           /* ARM hardware breakpoint registers */
+#define NT_ARM_HW_WATCH 0x403           /* ARM hardware watchpoint registers */
+#define NT_ARM_SYSTEM_CALL      0x404   /* ARM system call number */
 
 
 /* Note header in a PT_NOTE section */
@@ -1485,6 +1535,7 @@ struct elf32_fdpic_loadmap {
 #define elf_shdr	elf32_shdr
 #define elf_sym		elf32_sym
 #define elf_addr_t	Elf32_Off
+#define elf_rela  elf32_rela
 
 #ifdef ELF_USES_RELOCA
 # define ELF_RELOC      Elf32_Rela
@@ -1500,6 +1551,7 @@ struct elf32_fdpic_loadmap {
 #define elf_shdr	elf64_shdr
 #define elf_sym		elf64_sym
 #define elf_addr_t	Elf64_Off
+#define elf_rela  elf64_rela
 
 #ifdef ELF_USES_RELOCA
 # define ELF_RELOC      Elf64_Rela
@@ -1522,4 +1574,4 @@ struct elf32_fdpic_loadmap {
 #endif /* ELF_CLASS */
 
 
-#endif /* _QEMU_ELF_H */
+#endif /* QEMU_ELF_H */

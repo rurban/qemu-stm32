@@ -25,6 +25,7 @@
  * THE SOFTWARE.
  */
 
+#include "qemu/osdep.h"
 #include "hw/hw.h"
 #include "hw/sparc/sparc32_dma.h"
 #include "hw/sparc/sun4m.h"
@@ -304,7 +305,7 @@ static void sparc32_dma_class_init(ObjectClass *klass, void *data)
     dc->vmsd = &vmstate_dma;
     dc->props = sparc32_dma_properties;
     /* Reason: pointer property "iommu_opaque" */
-    dc->cannot_instantiate_with_device_add_yet = true;
+    dc->user_creatable = false;
 }
 
 static const TypeInfo sparc32_dma_info = {

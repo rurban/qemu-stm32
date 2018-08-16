@@ -8,9 +8,12 @@
  * GNU GPL, version 2 or (at your option) any later version.
  */
 
+#include "qemu/osdep.h"
 #include "hw/xen/xen_backend.h"
 #include "qmp-commands.h"
 #include "sysemu/char.h"
+#include "sysemu/accel.h"
+#include "migration/migration.h"
 
 //#define DEBUG_XEN
 
@@ -22,7 +25,7 @@
     do { } while (0)
 #endif
 
-static int store_dev_info(int domid, CharDriverState *cs, const char *string)
+static int store_dev_info(int domid, Chardev *cs, const char *string)
 {
     struct xs_handle *xs = NULL;
     char *path = NULL;
@@ -71,7 +74,7 @@ out:
     return ret;
 }
 
-void xenstore_store_pv_console_info(int i, CharDriverState *chr)
+void xenstore_store_pv_console_info(int i, Chardev *chr)
 {
     if (i == 0) {
         store_dev_info(xen_domid, chr, "/console");
@@ -109,15 +112,47 @@ static void xen_change_state_handler(void *opaque, int running,
     }
 }
 
-int xen_init(MachineClass *mc)
+static int xen_init(MachineState *ms)
 {
-    xen_xc = xen_xc_interface_open(0, 0, 0);
-    if (xen_xc == XC_HANDLER_INITIAL_VALUE) {
-        xen_be_printf(NULL, 0, "can't open xen interface\n");
+    xen_xc = xc_interface_open(0, 0, 0);
+    if (xen_xc == NULL) {
+        xen_pv_printf(NULL, 0, "can't open xen interface\n");
+        return -1;
+    }
+    xen_fmem = xenforeignmemory_open(0, 0);
+    if (xen_fmem == NULL) {
+        xen_pv_printf(NULL, 0, "can't open xen fmem interface\n");
+        xc_interface_close(xen_xc);
         return -1;
     }
     qemu_add_vm_change_state_handler(xen_change_state_handler, NULL);
 
+    global_state_set_optional();
+    savevm_skip_configuration();
+    savevm_skip_section_footers();
+
     return 0;
 }
 
+static void xen_accel_class_init(ObjectClass *oc, void *data)
+{
+    AccelClass *ac = ACCEL_CLASS(oc);
+    ac->name = "Xen";
+    ac->init_machine = xen_init;
+    ac->allowed = &xen_allowed;
+}
+
+#define TYPE_XEN_ACCEL ACCEL_CLASS_NAME("xen")
+
+static const TypeInfo xen_accel_type = {
+    .name = TYPE_XEN_ACCEL,
+    .parent = TYPE_ACCEL,
+    .class_init = xen_accel_class_init,
+};
+
+static void xen_type_init(void)
+{
+    type_register_static(&xen_accel_type);
+}
+
+type_init(xen_type_init);

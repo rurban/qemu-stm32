@@ -1,16 +1,24 @@
-#ifndef __QEMU_THREAD_WIN32_H
-#define __QEMU_THREAD_WIN32_H 1
-#include "windows.h"
+#ifndef QEMU_THREAD_WIN32_H
+#define QEMU_THREAD_WIN32_H
+
+#include <windows.h>
 
 struct QemuMutex {
-    CRITICAL_SECTION lock;
-    LONG owner;
+    SRWLOCK lock;
 };
 
+typedef struct QemuRecMutex QemuRecMutex;
+struct QemuRecMutex {
+    CRITICAL_SECTION lock;
+};
+
+void qemu_rec_mutex_destroy(QemuRecMutex *mutex);
+void qemu_rec_mutex_lock(QemuRecMutex *mutex);
+int qemu_rec_mutex_trylock(QemuRecMutex *mutex);
+void qemu_rec_mutex_unlock(QemuRecMutex *mutex);
+
 struct QemuCond {
-    LONG waiters, target;
-    HANDLE sema;
-    HANDLE continue_event;
+    CONDITION_VARIABLE var;
 };
 
 struct QemuSemaphore {
@@ -18,6 +26,7 @@ struct QemuSemaphore {
 };
 
 struct QemuEvent {
+    int value;
     HANDLE event;
 };
 
