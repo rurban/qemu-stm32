@@ -6,7 +6,7 @@ msgid ""
 msgstr ""
 "Project-Id-Version: QEMU 1.4.50\n"
 "Report-Msgid-Bugs-To: qemu-devel@nongnu.org\n"
-"POT-Creation-Date: 2015-12-10 13:29+0000\n"
+"POT-Creation-Date: 2018-08-16 14:59+0200\n"
 "PO-Revision-Date: 2012-02-28 16:00+0100\n"
 "Last-Translator: Kevin Wolf <kwolf@redhat.com>\n"
 "Language-Team: Deutsch <de@li.org>\n"
@@ -24,62 +24,62 @@ msgstr " - Strg+Alt+G drücken, um Eingabegeräte freizugeben"
 msgid " [Paused]"
 msgstr " [Angehalten]"
 
-#: ui/gtk.c:1783
+#: ui/gtk.c:1789
 msgid "_Pause"
 msgstr "_Angehalten"
 
-#: ui/gtk.c:1789
+#: ui/gtk.c:1795
 msgid "_Reset"
 msgstr "_Reset"
 
-#: ui/gtk.c:1792
+#: ui/gtk.c:1798
 msgid "Power _Down"
 msgstr "_Herunterfahren"
 
-#: ui/gtk.c:1798
+#: ui/gtk.c:1804
 msgid "_Quit"
 msgstr "_Beenden"
 
-#: ui/gtk.c:1890
+#: ui/gtk.c:1896
 msgid "_Fullscreen"
 msgstr "_Vollbild"
 
-#: ui/gtk.c:1904
+#: ui/gtk.c:1910
 msgid "Zoom _In"
 msgstr "_Heranzoomen"
 
-#: ui/gtk.c:1911
+#: ui/gtk.c:1917
 msgid "Zoom _Out"
 msgstr "_Wegzoomen"
 
-#: ui/gtk.c:1918
+#: ui/gtk.c:1924
 msgid "Best _Fit"
 msgstr "_Einpassen"
 
-#: ui/gtk.c:1925
+#: ui/gtk.c:1931
 msgid "Zoom To _Fit"
 msgstr "Auf _Fenstergröße skalieren"
 
-#: ui/gtk.c:1931
+#: ui/gtk.c:1937
 msgid "Grab On _Hover"
 msgstr "Tastatur _automatisch einfangen"
 
-#: ui/gtk.c:1934
+#: ui/gtk.c:1940
 msgid "_Grab Input"
 msgstr "_Eingabegeräte einfangen"
 
-#: ui/gtk.c:1963
+#: ui/gtk.c:1969
 msgid "Show _Tabs"
 msgstr "Reiter anzeigen"
 
-#: ui/gtk.c:1966
+#: ui/gtk.c:1972
 msgid "Detach Tab"
 msgstr "Reiter abtrennen"
 
-#: ui/gtk.c:1978
+#: ui/gtk.c:1984
 msgid "_Machine"
 msgstr "_Maschine"
 
-#: ui/gtk.c:1983
+#: ui/gtk.c:1989
 msgid "_View"
 msgstr "_Ansicht"
