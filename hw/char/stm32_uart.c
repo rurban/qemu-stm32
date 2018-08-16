@@ -226,14 +226,14 @@ void stm32_afio_uart_check_tx_pin_callback(Stm32Uart *s)
     Stm32Gpio *gpio_dev = s->stm32_gpio[tx_periph - STM32F1XX_GPIOA];
 
     if(stm32_gpio_get_mode_bits(gpio_dev, tx_pin) == STM32_GPIO_MODE_IN) {
-        hw_error("UART TX pin needs to be configured as output");
+        printf("warning: UART TX pin needs to be configured as output\n");
     }
 
     config = stm32_gpio_get_config_bits(gpio_dev, tx_pin);
     if((config != STM32_GPIO_OUT_ALT_PUSHPULL) &&
        (config != STM32_GPIO_OUT_ALT_OPEN)) {
-        hw_error("UART TX pin needs to be configured as "
-                 "alternate function output");
+        printf("warning: UART TX pin needs to be configured as "
+                 "alternate function output\n");
     }
 }
 
@@ -485,16 +485,18 @@ static void stm32_uart_USART_SR_write(Stm32Uart *s, uint32_t new_value)
     new_TC = extract32(new_value, USART_SR_TC_BIT, 1);
     /* The Transmit Complete flag can be cleared, but not set. */
     if(new_TC) {
-        hw_error("Software attempted to set USART TC bit\n");
+        //printf("Software attempted to set USART TC bit\n");
+    } else {
+        s->USART_SR_TC = new_TC;
     }
-    s->USART_SR_TC = new_TC;
 
     new_RXNE = extract32(new_value, USART_SR_RXNE_BIT, 1);
     /* The Read Data Register Not Empty flag can be cleared, but not set. */
     if(new_RXNE) {
-        hw_error("Software attempted to set USART RXNE bit\n");
+        //printf("Software attempted to set USART RXNE bit\n");
+    } else {
+        s->USART_SR_RXNE = new_RXNE;
     }
-    s->USART_SR_RXNE = new_RXNE;
 
     stm32_uart_update_irq(s);
 }
@@ -653,7 +655,7 @@ static uint64_t stm32_uart_read(void *opaque, hwaddr offset,
                           unsigned size)
 {
     Stm32Uart *s = (Stm32Uart *)opaque;
-    uint32_t value;
+    uint32_t value = 0;
     int start = (offset & 3) * 8;
     int length = size * 8;
 

@@ -433,7 +433,8 @@ static uint64_t stm32_rcc_readw(void *opaque, hwaddr offset)
         case RCC_CSR_OFFSET:
             return stm32_rcc_RCC_CSR_read(s);
         case RCC_AHBRSTR:
-            STM32_NOT_IMPL_REG(offset, 4);
+            printf("stm32_rcc_read: RCC_AHBRSTR: read: no action taken!\n");
+            //STM32_NOT_IMPL_REG(offset, 4);
             return 0;
         case RCC_CFGR2_OFFSET:
             STM32_NOT_IMPL_REG(offset, 4);
@@ -463,7 +464,8 @@ static void stm32_rcc_writew(void *opaque, hwaddr offset,
         case RCC_APB2RSTR_OFFSET:
         case RCC_APB1RSTR_OFFSET:
         case RCC_AHBENR_OFFSET:
-            STM32_NOT_IMPL_REG(offset, 4);
+            //STM32_NOT_IMPL_REG(offset, 4);
+            printf("stm32_rcc_writew: RCC_APB2RSTR: write: no action taken!\n");
             break;
         case RCC_APB2ENR_OFFSET:
             stm32_rcc_RCC_APB2ENR_write(s, value, false);
@@ -478,10 +480,12 @@ static void stm32_rcc_writew(void *opaque, hwaddr offset,
             stm32_rcc_RCC_CSR_write(s, value, false);
             break;
         case RCC_AHBRSTR:
-            STM32_NOT_IMPL_REG(offset, 4);
+            printf("stm32_rcc_writew: RCC_AHBRSTR: write: no action taken!\n");
+            //STM32_NOT_IMPL_REG(offset, 4);
             break;
         case RCC_CFGR2_OFFSET:
-            STM32_NOT_IMPL_REG(offset, 4);
+            printf("stm32_rcc_writew: RCC_CFGR2R: write: no action taken!\n");
+            //STM32_NOT_IMPL_REG(offset, 4);
             break;
         default:
             STM32_BAD_REG(offset, 4);
@@ -493,6 +497,7 @@ static uint64_t stm32_rcc_read(void *opaque, hwaddr offset,
                                unsigned size)
 {
     switch(size) {
+        case 2:
         case 4:
             return stm32_rcc_readw(opaque, offset);
         default:
@@ -505,6 +510,7 @@ static void stm32_rcc_write(void *opaque, hwaddr offset,
                             uint64_t value, unsigned size)
 {
     switch(size) {
+        case 2:
         case 4:
             stm32_rcc_writew(opaque, offset, value);
             break;
