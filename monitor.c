@@ -2119,6 +2119,7 @@ static const mon_cmd_t qmp_cmds[] = {
 static const char *pch;
 static sigjmp_buf expr_env;
 
+
 static void GCC_FMT_ATTR(2, 3) QEMU_NORETURN
 expr_error(Monitor *mon, const char *fmt, ...)
 {

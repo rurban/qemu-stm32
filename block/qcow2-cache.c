@@ -295,6 +295,7 @@ int qcow2_cache_empty(BlockDriverState *bs, Qcow2Cache *c)
         c->entries[i].offset = 0;
         c->entries[i].lru_counter = 0;
     }
+
     qcow2_cache_table_release(bs, c, 0, c->size);
 
     c->lru_counter = 0;

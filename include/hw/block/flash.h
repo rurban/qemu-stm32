@@ -27,17 +27,7 @@ pflash_t *pflash_cfi02_register(hwaddr base,
                                 uint16_t unlock_addr0, uint16_t unlock_addr1,
                                 int be);
 
-/* pflash_jedec_424.c */
-pflash_t *pflash_jedec_424_register(hwaddr base,
-                                DeviceState *qdev, const char *name,
-                                hwaddr size,
-                                BlockBackend *blk,
-                                uint32_t sector_len, int nb_blocs, uint32_t bank_size,
-                                int bank_width, uint16_t id0, uint16_t id1,
-                                uint16_t id2, uint16_t id3, int be);
-
 MemoryRegion *pflash_cfi01_get_memory(pflash_t *fl);
-MemoryRegion *pflash_jedec_424_get_memory(pflash_t *fl);
 
 /* nand.c */
 DeviceState *nand_init(BlockBackend *blk, int manf_id, int chip_id);
@@ -71,7 +61,4 @@ uint8_t ecc_digest(ECCState *s, uint8_t sample);
 void ecc_reset(ECCState *s);
 extern VMStateDescription vmstate_ecc_state;
 
-typedef struct f2xx_flash f2xx_flash_t;
-f2xx_flash_t *f2xx_flash_register(BlockBackend *blk, hwaddr base,
-                                  hwaddr size);
 #endif

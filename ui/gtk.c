@@ -1376,9 +1376,6 @@ static void gd_ungrab_keyboard(GtkDisplayState *s)
 
 static void gd_grab_pointer(VirtualConsole *vc, const char *reason)
 {
-#ifdef NO_MOUSE
-    return;
-#endif
     GdkDisplay *display = gtk_widget_get_display(vc->gfx.drawing_area);
 
     if (vc->s->ptr_owner) {
@@ -1421,9 +1418,6 @@ static void gd_grab_pointer(VirtualConsole *vc, const char *reason)
 
 static void gd_ungrab_pointer(GtkDisplayState *s)
 {
-#ifdef NO_MOUSE
-    return;
-#endif
     VirtualConsole *vc = s->ptr_owner;
 
     if (vc == NULL) {

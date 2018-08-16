@@ -5,9 +5,9 @@
 #, fuzzy
 msgid ""
 msgstr ""
-"Project-Id-Version: QEMU 2.5.0-pebble4\n"
+"Project-Id-Version: QEMU 2.4.93\n"
 "Report-Msgid-Bugs-To: qemu-devel@nongnu.org\n"
-"POT-Creation-Date: 2018-08-16 14:59+0200\n"
+"POT-Creation-Date: 2015-12-10 13:29+0000\n"
 "PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
 "Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
 "Language-Team: LANGUAGE <LL@li.org>\n"
@@ -24,62 +24,62 @@ msgstr ""
 msgid " [Paused]"
 msgstr ""
 
-#: ui/gtk.c:1789
+#: ui/gtk.c:1783
 msgid "_Pause"
 msgstr ""
 
-#: ui/gtk.c:1795
+#: ui/gtk.c:1789
 msgid "_Reset"
 msgstr ""
 
-#: ui/gtk.c:1798
+#: ui/gtk.c:1792
 msgid "Power _Down"
 msgstr ""
 
-#: ui/gtk.c:1804
+#: ui/gtk.c:1798
 msgid "_Quit"
 msgstr ""
 
-#: ui/gtk.c:1896
+#: ui/gtk.c:1890
 msgid "_Fullscreen"
 msgstr ""
 
-#: ui/gtk.c:1910
+#: ui/gtk.c:1904
 msgid "Zoom _In"
 msgstr ""
 
-#: ui/gtk.c:1917
+#: ui/gtk.c:1911
 msgid "Zoom _Out"
 msgstr ""
 
-#: ui/gtk.c:1924
+#: ui/gtk.c:1918
 msgid "Best _Fit"
 msgstr ""
 
-#: ui/gtk.c:1931
+#: ui/gtk.c:1925
 msgid "Zoom To _Fit"
 msgstr ""
 
-#: ui/gtk.c:1937
+#: ui/gtk.c:1931
 msgid "Grab On _Hover"
 msgstr ""
 
-#: ui/gtk.c:1940
+#: ui/gtk.c:1934
 msgid "_Grab Input"
 msgstr ""
 
-#: ui/gtk.c:1969
+#: ui/gtk.c:1963
 msgid "Show _Tabs"
 msgstr ""
 
-#: ui/gtk.c:1972
+#: ui/gtk.c:1966
 msgid "Detach Tab"
 msgstr ""
 
-#: ui/gtk.c:1984
+#: ui/gtk.c:1978
 msgid "_Machine"
 msgstr ""
 
-#: ui/gtk.c:1989
+#: ui/gtk.c:1983
 msgid "_View"
 msgstr ""

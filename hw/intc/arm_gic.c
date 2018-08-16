@@ -26,7 +26,7 @@
 
 #ifdef DEBUG_GIC
 #define DPRINTF(fmt, ...) \
-do { printf("DEBUG_GIC: " fmt , ## __VA_ARGS__); usleep(100);} while (0)
+do { fprintf(stderr, "arm_gic: " fmt , ## __VA_ARGS__); } while (0)
 #else
 #define DPRINTF(fmt, ...) do {} while(0)
 #endif
@@ -232,7 +232,6 @@ static int gic_get_group_priority(GICState *s, int cpu, int irq)
         bpr = s->abpr[cpu];
     } else {
         bpr = s->bpr[cpu];
-        return GIC_GET_PRIORITY(irq, cpu);
     }
 
     /* a BPR of 0 means the group priority bits are [7:1];

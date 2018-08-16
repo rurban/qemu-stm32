@@ -646,8 +646,9 @@ static BlockAIOCB *read_quorum_children(QuorumAIOCB *acb)
     }
 
     for (i = 0; i < s->num_children; i++) {
-        bdrv_aio_readv(s->children[i]->bs, acb->sector_num, &acb->qcrs[i].qiov,
-                       acb->nb_sectors, quorum_aio_cb, &acb->qcrs[i]);
+        acb->qcrs[i].aiocb = bdrv_aio_readv(s->children[i]->bs, acb->sector_num,
+                                            &acb->qcrs[i].qiov, acb->nb_sectors,
+                                            quorum_aio_cb, &acb->qcrs[i]);
     }
 
     return &acb->common;
@@ -662,9 +663,10 @@ static BlockAIOCB *read_fifo_child(QuorumAIOCB *acb)
     qemu_iovec_init(&acb->qcrs[acb->child_iter].qiov, acb->qiov->niov);
     qemu_iovec_clone(&acb->qcrs[acb->child_iter].qiov, acb->qiov,
                      acb->qcrs[acb->child_iter].buf);
-    bdrv_aio_readv(s->children[acb->child_iter]->bs, acb->sector_num,
-                   &acb->qcrs[acb->child_iter].qiov, acb->nb_sectors,
-                   quorum_aio_cb, &acb->qcrs[acb->child_iter]);
+    acb->qcrs[acb->child_iter].aiocb =
+        bdrv_aio_readv(s->children[acb->child_iter]->bs, acb->sector_num,
+                       &acb->qcrs[acb->child_iter].qiov, acb->nb_sectors,
+                       quorum_aio_cb, &acb->qcrs[acb->child_iter]);
 
     return &acb->common;
 }
@@ -890,6 +892,12 @@ static int quorum_open(BlockDriverState *bs, QDict *options, int flags,
     }
 
     s->threshold = qemu_opt_get_number(opts, QUORUM_OPT_VOTE_THRESHOLD, 0);
+    /* and validate it against s->num_children */
+    ret = quorum_valid_threshold(s->threshold, s->num_children, &local_err);
+    if (ret < 0) {
+        goto exit;
+    }
+
     ret = parse_read_pattern(qemu_opt_get(opts, QUORUM_OPT_READ_PATTERN));
     if (ret < 0) {
         error_setg(&local_err, "Please set read-pattern as fifo or quorum");

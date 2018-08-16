@@ -661,6 +661,10 @@ static bool ahci_map_fis_address(AHCIDevice *ad)
 
 static void ahci_unmap_fis_address(AHCIDevice *ad)
 {
+    if (ad->res_fis == NULL) {
+        DPRINTF(ad->port_no, "Attempt to unmap NULL FIS address\n");
+        return;
+    }
     dma_memory_unmap(ad->hba->as, ad->res_fis, 256,
                      DMA_DIRECTION_FROM_DEVICE, 256);
     ad->res_fis = NULL;
@@ -677,6 +681,10 @@ static bool ahci_map_clb_address(AHCIDevice *ad)
 
 static void ahci_unmap_clb_address(AHCIDevice *ad)
 {
+    if (ad->lst == NULL) {
+        DPRINTF(ad->port_no, "Attempt to unmap NULL CLB address\n");
+        return;
+    }
     dma_memory_unmap(ad->hba->as, ad->lst, 1024,
                      DMA_DIRECTION_FROM_DEVICE, 1024);
     ad->lst = NULL;
@@ -910,6 +918,7 @@ static void ncq_err(NCQTransferState *ncq_tfs)
     ide_state->error = ABRT_ERR;
     ide_state->status = READY_STAT | ERR_STAT;
     ncq_tfs->drive->port_regs.scr_err |= (1 << ncq_tfs->tag);
+    ncq_tfs->used = 0;
 }
 
 static void ncq_finish(NCQTransferState *ncq_tfs)
@@ -1209,31 +1218,6 @@ static int handle_cmd(AHCIState *s, int port, uint8_t slot)
     if (!s->dev[port].lst) {
         DPRINTF(port, "error: lst not given but cmd handled");
         return -1;
-    }
-    cmd = get_cmd_header(s, port, slot);
-    /* remember current slot handle for later */
-    s->dev[port].cur_cmd = cmd;
-
-    /* The device we are working for */
-    ide_state = &s->dev[port].port.ifs[0];
-    if (!ide_state->blk) {
-        DPRINTF(port, "error: guest accessed unused port");
-        return -1;
-    }
-
-    tbl_addr = le64_to_cpu(cmd->tbl_addr);
-    cmd_len = 0x80;
-    cmd_fis = dma_memory_map(s->as, tbl_addr, &cmd_len,
-                             DMA_DIRECTION_FROM_DEVICE);
-    if (!cmd_fis) {
-        DPRINTF(port, "error: guest passed us an invalid cmd fis\n");
-        return -1;
-    } else if (cmd_len != 0x80) {
-        ahci_trigger_irq(s, &s->dev[port], PORT_IRQ_HBUS_ERR);
-        DPRINTF(port, "error: dma_memory_map failed: "
-                "(len(%02"PRIx64") != 0x80)\n",
-                cmd_len);
-        goto out;
     }
     cmd = get_cmd_header(s, port, slot);
     /* remember current slot handle for later */

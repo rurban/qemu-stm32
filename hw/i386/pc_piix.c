@@ -76,7 +76,7 @@ static bool has_reserved_memory = true;
 static bool kvmclock_enabled = true;
 
 /* PC hardware initialisation */
-static void pc_init1(MachineState *machine)
+static void pc_init1(MachineState *machine,
                      const char *host_type, const char *pci_type)
 {
     PCMachineState *pcms = PC_MACHINE(machine);
@@ -876,6 +876,7 @@ DEFINE_I440FX_MACHINE(v0_12, "pc-0.12", pc_compat_0_13,
             .property = "ver",\
             .value    = "0.11",\
         },
+
 static void pc_i440fx_0_11_machine_options(MachineClass *m)
 {
     pc_i440fx_0_12_machine_options(m);
@@ -909,7 +910,7 @@ DEFINE_I440FX_MACHINE(v0_11, "pc-0.11", pc_compat_0_13,
         .driver   = "scsi-disk",\
         .property = "ver",\
         .value    = "0.10",\
-        },
+    },
 
 static void pc_i440fx_0_10_machine_options(MachineClass *m)
 {
@@ -975,6 +976,7 @@ static const IGDDeviceIDInfo igd_combo_id_infos[] = {
     {0x162B, 0x9cc3, 0x03}, /* BDWHALO28W, BDWM_w7 */
     {0x162A, 0x9cc3, 0x03}, /* BDWGT3WRKS, BDWM_w7 */
     {0x162D, 0x9cc3, 0x03}, /* BDWGT3SRVR, BDWM_w7 */
+};
 
 static void isa_bridge_class_init(ObjectClass *klass, void *data)
 {
@@ -984,6 +986,7 @@ static void isa_bridge_class_init(ObjectClass *klass, void *data)
     dc->desc        = "ISA bridge faked to support IGD PT";
     k->vendor_id    = PCI_VENDOR_ID_INTEL;
     k->class_id     = PCI_CLASS_BRIDGE_ISA;
+};
 
 static TypeInfo isa_bridge_info = {
     .name          = "igd-passthrough-isa-bridge",
@@ -999,10 +1002,6 @@ static void pt_graphics_register_types(void)
 type_init(pt_graphics_register_types)
 
 void igd_passthrough_isa_bridge_create(PCIBus *bus, uint16_t gpu_dev_id)
-                      pc_i440fx_0_10_machine_options);
-
-
-static void isapc_machine_options(MachineClass *m)
 {
     struct PCIDevice *bridge_dev;
     int i, num;

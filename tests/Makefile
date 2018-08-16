@@ -218,9 +218,8 @@ check-qtest-sparc64-y = tests/endianness-test$(EXESUF)
 gcov-files-sparc-y += hw/timer/m48t59.c
 gcov-files-sparc64-y += hw/timer/m48t59.c
 check-qtest-arm-y = tests/tmp105-test$(EXESUF)
+check-qtest-arm-y = tests/ds1338-test$(EXESUF)
 gcov-files-arm-y += hw/misc/tmp105.c
-check-qtest-arm-y += tests/ds1338-test$(EXESUF)
-check-qtest-arm-y += tests/test-stm32$(EXESUF)
 check-qtest-arm-y += tests/virtio-blk-test$(EXESUF)
 gcov-files-arm-y += arm-softmmu/hw/block/virtio-blk.c
 check-qtest-ppc-y += tests/boot-order-test$(EXESUF)
@@ -535,7 +534,6 @@ tests/vhost-user-test$(EXESUF): tests/vhost-user-test.o qemu-char.o qemu-timer.o
 tests/qemu-iotests/socket_scm_helper$(EXESUF): tests/qemu-iotests/socket_scm_helper.o
 tests/test-qemu-opts$(EXESUF): tests/test-qemu-opts.o $(test-util-obj-y)
 tests/test-write-threshold$(EXESUF): tests/test-write-threshold.o $(test-block-obj-y)
-tests/test-stm32$(EXESUF): tests/test-stm32.o
 tests/test-netfilter$(EXESUF): tests/test-netfilter.o $(qtest-obj-y)
 tests/ivshmem-test$(EXESUF): tests/ivshmem-test.o contrib/ivshmem-server/ivshmem-server.o $(libqos-pc-obj-y)
 tests/vhost-user-bridge$(EXESUF): tests/vhost-user-bridge.o

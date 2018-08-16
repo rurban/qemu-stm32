@@ -783,7 +783,6 @@ static int hdev_probe_geometry(BlockDriverState *bs, HDGeometry *geo)
 {
     BDRVRawState *s = bs->opaque;
     struct hd_geometry ioctl_geo = {0};
-    uint32_t blksize;
 
     /* If DASD, get its geometry */
     if (check_for_dasd(s->fd) < 0) {
@@ -803,12 +802,6 @@ static int hdev_probe_geometry(BlockDriverState *bs, HDGeometry *geo)
     }
     geo->heads = ioctl_geo.heads;
     geo->sectors = ioctl_geo.sectors;
-    if (!probe_physical_blocksize(s->fd, &blksize)) {
-        /* overwrite cyls: HDIO_GETGEO result is incorrect for big drives */
-        geo->cylinders = bdrv_nb_sectors(bs) / (blksize / BDRV_SECTOR_SIZE)
-                                             / (geo->heads * geo->sectors);
-        return 0;
-    }
     geo->cylinders = ioctl_geo.cylinders;
 
     return 0;
@@ -1150,17 +1143,6 @@ static ssize_t handle_aiocb_write_zeroes(RawPosixAIOData *aiocb)
             }
             s->has_fallocate = false;
         } else if (ret != -ENOTSUP) {
-            return ret;
-        } else {
-            s->has_discard = false;
-        }
-    }
-#endif
-
-#ifdef CONFIG_FALLOCATE
-    if (s->has_fallocate && aiocb->aio_offset >= bdrv_getlength(aiocb->bs)) {
-        int ret = do_fallocate(s->fd, 0, aiocb->aio_offset, aiocb->aio_nbytes);
-        if (ret == 0 || ret != -ENOTSUP) {
             return ret;
         } else {
             s->has_discard = false;

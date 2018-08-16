@@ -343,7 +343,6 @@ tpm="yes"
 libssh2=""
 vhdx=""
 numa=""
-mouse="yes"
 tcmalloc="no"
 jemalloc="no"
 
@@ -1161,8 +1160,6 @@ for opt do
   --disable-numa) numa="no"
   ;;
   --enable-numa) numa="yes"
-  ;;
-  --disable-mouse) mouse="no"
   ;;
   --disable-tcmalloc) tcmalloc="no"
   ;;
@@ -4497,13 +4494,6 @@ if test "$fortify_source" != "no"; then
 fi
 
 ##########################################
-# check for mouse support
-
-if test "$mouse" = "no"; then
-  CFLAGS="-DNO_MOUSE $CFLAGS"
-fi
-
-##########################################
 # End of CC checks
 # After here, no more $cc or $ld runs
 
@@ -4768,7 +4758,11 @@ echo "GTK GL support    $gtk_gl"
 echo "GNUTLS support    $gnutls"
 echo "GNUTLS hash       $gnutls_hash"
 echo "libgcrypt         $gcrypt"
-echo "nettle            $nettle ${nettle+($nettle_version)}"
+if test "$nettle" = "yes"; then
+    echo "nettle            $nettle ($nettle_version)"
+else
+    echo "nettle            $nettle"
+fi
 echo "libtasn1          $tasn1"
 echo "VTE support       $vte"
 echo "curses support    $curses"
@@ -4853,7 +4847,6 @@ echo "bzip2 support     $bzip2"
 echo "NUMA host support $numa"
 echo "tcmalloc support  $tcmalloc"
 echo "jemalloc support  $jemalloc"
-echo "Mouse support     $mouse"
 
 if test "$sdl_too_old" = "yes"; then
 echo "-> Your SDL version is too old - please upgrade to have SDL support"

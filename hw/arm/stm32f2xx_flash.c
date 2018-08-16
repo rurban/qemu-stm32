@@ -28,7 +28,7 @@
 #include "hw/sysbus.h"
 
 
-struct f2xx_flash {
+typedef struct f2xx_flash {
     SysBusDevice busdev;
     BlockBackend *blk;
     hwaddr base_address;
@@ -36,7 +36,7 @@ struct f2xx_flash {
 
     MemoryRegion mem;
     void *data;
-}; // f2xx_flash_t;
+} f2xx_flash_t;
 
 /* */
 f2xx_flash_t *f2xx_flash_register(BlockBackend *blk, hwaddr base,

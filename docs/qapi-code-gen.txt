@@ -138,53 +138,6 @@ For example, a usage statement that includes '*base':STRUCT-NAME
 means that an expression has an optional key 'base', which if present
 must have a value that forms a struct name.
 
-There are seven top-level expressions recognized by the parser:
-'include', 'command', 'struct', 'enum', 'union', 'alternate', and
-'event'.  There are several groups of types: simple types (a number of
-built-in types, such as 'int' and 'str'; as well as enumerations),
-complex types (structs and two flavors of unions), and alternate types
-(a choice between other types).  The 'command' and 'event' expressions
-can refer to existing types by name, or list an anonymous type as a
-dictionary. Listing a type name inside an array refers to a
-single-dimension array of that type; multi-dimension arrays are not
-directly supported (although an array of a complex struct that
-contains an array member is possible).
-
-Types, commands, and events share a common namespace.  Therefore,
-generally speaking, type definitions should always use CamelCase for
-user-defined type names, while built-in types are lowercase. Type
-definitions should not end in 'Kind', as this namespace is used for
-creating implicit C enums for visiting union types.  Command names,
-and field names within a type, should be all lower case with words
-separated by a hyphen.  However, some existing older commands and
-complex types use underscore; when extending such expressions,
-consistency is preferred over blindly avoiding underscore.  Event
-names should be ALL_CAPS with words separated by underscore.  The
-special string '**' appears for some commands that manually perform
-their own type checking rather than relying on the type-safe code
-produced by the qapi code generators.
-
-Any name (command, event, type, field, or enum value) beginning with
-"x-" is marked experimental, and may be withdrawn or changed
-incompatibly in a future release.  Downstream vendors may add
-extensions; such extensions should begin with a prefix matching
-"__RFQDN_" (for the reverse-fully-qualified-domain-name of the
-vendor), even if the rest of the name uses dash (example:
-__com.redhat_drive-mirror).  Other than downstream extensions (with
-leading underscore and the use of dots), all names should begin with a
-letter, and contain only ASCII letters, digits, dash, and underscore.
-It is okay to reuse names that match C keywords; the generator will
-rename a field named "default" in the QAPI to "q_default" in the
-generated C code.
-
-In the rest of this document, usage lines are given for each
-expression type, with literal strings written in lower case and
-placeholders written in capitals.  If a literal string includes a
-prefix of '*', that key/value pair can be omitted from the expression.
-For example, a usage statement that includes '*base':STRUCT-NAME
-means that an expression has an optional key 'base', which if present
-must have a value that forms a struct name.
-
 
 === Built-in Types ===
 
@@ -228,11 +181,6 @@ from making a forward reference to a type that is only introduced by
 an outer file.  The parser may be made stricter in the future to
 prevent incomplete include files.
 
-As a matter of style, it is a good idea to have all files be
-self-contained, but at the moment, nothing prevents an included file
-from making a forward reference to a type that is only introduced by
-an outer file.  The parser may be made stricter in the future to
-prevent incomplete include files.
 
 === Struct types ===
 
@@ -243,8 +191,6 @@ value is a dictionary.  This corresponds to a struct in C or an Object
 in JSON. Each value of the 'data' dictionary must be the name of a
 type, or a one-element array containing a type name.  An example of a
 struct is:
-
- { 'struct': 'MyType',
 
  { 'struct': 'MyType',
    'data': { 'member1': 'str', 'member2': 'int', '*member3': 'str' } }
@@ -378,6 +324,7 @@ the wire will be combination of fields from both the base type and the
 appropriate branch type (when merging two dictionaries, there must be
 no keys in common).  The 'discriminator' field must be the name of an
 enum-typed member of the base struct.
+
 The following example enhances the above simple union example by
 adding a common field 'readonly', renaming the discriminator to
 something more applicable, and reducing the number of {} required on
@@ -386,9 +333,14 @@ the wire:
  { 'enum': 'BlockdevDriver', 'data': [ 'file', 'qcow2' ] }
  { 'struct': 'BlockdevCommonOptions',
    'data': { 'driver': 'BlockdevDriver', 'readonly': 'bool' } }
+ { 'union': 'BlockdevOptions',
+   'base': 'BlockdevCommonOptions',
    'discriminator': 'driver',
    'data': { 'file': 'FileOptions',
+             'qcow2': 'Qcow2Options' } }
+
 Resulting in these JSON objects:
+
  { "driver": "file", "readonly": true,
    "filename": "/some/place/my-image" }
  { "driver": "qcow2", "readonly": false,
@@ -415,27 +367,6 @@ is identical on the wire to:
  { 'struct': 'Branch1', 'data': { 'data': 'str' } }
  { 'struct': 'Branch2', 'data': { 'data': 'int' } }
  { 'union': 'Flat', 'base': 'Base', 'discriminator': 'type',
-   'data': { 'one': 'Branch1', 'two': 'Branch2' } }
-
-Notice that in a flat union, the discriminator name is controlled by
-the user, but because it must map to a base member with enum type, the
-code generator can ensure that branches exist for all values of the
-enum (although the order of the keys need not match the declaration of
-the enum).  In the resulting generated C data types, a flat union is
-represented as a struct with the base member fields included directly,
-and then a union of structures for each branch of the struct.
-
-=== Alternate types ===
-
-Usage: { 'alternate': STRING, 'data': DICT }
-
-An alternate type is one that allows a choice between two or more JSON
-data types (string, integer, number, or object, but currently not
-array) on the wire.  The definition is similar to a simple union type,
-where each branch of the union names a QAPI type.  For example:
-
- { 'alternate': 'BlockRef',
- { 'union': 'Flat': 'base': 'Base', 'discriminator': 'type',
    'data': { 'one': 'Branch1', 'two': 'Branch2' } }
 
 
@@ -547,8 +478,6 @@ command is expected to change state in a way that a successful
 response is not possible (although the command will still return a
 normal dictionary error on failure).  When a successful reply is not
 possible, the command expression should include the optional key
-'success-response' with boolean value false.  So far, only QGA makes
-use of this field.
 'success-response' with boolean value false.  So far, only QGA makes
 use of this field.
 

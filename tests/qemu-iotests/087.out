@@ -80,8 +80,6 @@ QMP_VERSION
 {"return": {}}
 {"error": {"class": "GenericError", "desc": "Invalid parameter type for 'driver', expected: string"}}
 {"return": {}}
-{"error": {"class": "GenericError", "desc": "Invalid parameter type for 'driver', expected: string"}}
-{"return": {}}
 {"timestamp": {"seconds":  TIMESTAMP, "microseconds":  TIMESTAMP}, "event": "SHUTDOWN"}
 
 *** done

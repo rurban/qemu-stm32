@@ -64,10 +64,6 @@
  * anything else is implemented as exit(1) */
 #define ADP_Stopped_ApplicationExit     (0x20026)
 
-/* ADP_Stopped_ApplicationExit is used for exit(0),
- * anything else is implemented as exit(1) */
-#define ADP_Stopped_ApplicationExit     (0x20026)
-
 #ifndef O_BINARY
 #define O_BINARY 0
 #endif

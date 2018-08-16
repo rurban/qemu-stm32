@@ -484,6 +484,8 @@ void pc_cmos_init(PCMachineState *pcms,
     set_boot_dev(s, MACHINE(pcms)->boot_order, &local_err);
     if (local_err) {
         error_report_err(local_err);
+        exit(1);
+    }
 
     val = 0;
     val |= 0x02; /* FPU is there */

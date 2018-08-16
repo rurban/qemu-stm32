@@ -490,10 +490,13 @@ QemuCocoaView *cocoaView;
         [[fullScreenWindow contentView] setFrame:[[NSScreen mainScreen] frame]];
         [normalWindow setFrame:NSMakeRect([normalWindow frame].origin.x, [normalWindow frame].origin.y - h + oldh, w, h + [normalWindow frame].size.height - oldh) display:NO animate:NO];
     } else {
-        if (qemu_name) {
+        if (qemu_name)
             [normalWindow setTitle:[NSString stringWithFormat:@"QEMU %s", qemu_name]];
-        }
         [normalWindow setFrame:NSMakeRect([normalWindow frame].origin.x, [normalWindow frame].origin.y - h + oldh, w, h + [normalWindow frame].size.height - oldh) display:YES animate:NO];
+    }
+
+    if (isResize) {
+        [normalWindow center];
     }
 }
 
@@ -763,9 +766,6 @@ QemuCocoaView *cocoaView;
 
 - (void) grabMouse
 {
-#ifdef NO_MOUSE
-    return;
-#endif
     COCOA_DEBUG("QemuCocoaView: grabMouse\n");
 
     if (!isFullscreen) {
@@ -784,9 +784,6 @@ QemuCocoaView *cocoaView;
 
 - (void) ungrabMouse
 {
-#ifdef NO_MOUSE
-    return;
-#endif
     COCOA_DEBUG("QemuCocoaView: ungrabMouse\n");
 
     if (!isFullscreen) {
@@ -910,12 +907,6 @@ QemuCocoaView *cocoaView;
         // set the supported image file types that can be opened
         supportedImageFileTypes = [NSArray arrayWithObjects: @"img", @"iso", @"dmg",
                                  @"qcow", @"qcow2", @"cloop", @"vmdk", nil];
-
-        // Save window position
-        [[normalWindow windowController] setShouldCascadeWindows:NO];
-        [normalWindow setFrameAutosaveName:@"normalWindow"];
-
-        [normalWindow makeKeyAndOrderFront:self];
     }
     return self;
 }
@@ -1144,9 +1135,6 @@ QemuCocoaView *cocoaView;
 /* Verifies if the user really wants to quit */
 - (BOOL)verifyQuit
 {
-#ifdef SKIP_QUIT_PROMPT
-    return YES;
-#else
     NSAlert *alert = [NSAlert new];
     [alert autorelease];
     [alert setMessageText: @"Are you sure you want to quit QEMU?"];
@@ -1157,7 +1145,6 @@ QemuCocoaView *cocoaView;
     } else {
         return NO;
     }
-#endif
 }
 
 @end
@@ -1262,9 +1249,6 @@ int main (int argc, const char * argv[]) {
     QemuCocoaAppController *appController = [[QemuCocoaAppController alloc] init];
     [NSApp setDelegate:appController];
 
-    // Bring application to the front of all windows
-    [NSApp activateIgnoringOtherApps:YES];
-    
     // Start the main event loop
     [NSApp run];
 
