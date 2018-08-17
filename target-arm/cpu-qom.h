@@ -47,6 +47,8 @@ typedef struct ARMCPUClass {
 
     DeviceRealize parent_realize;
     void (*parent_reset)(CPUState *cpu);
+
+    DeviceState *nvic;
 } ARMCPUClass;
 
 typedef struct ARMCPU ARMCPU;

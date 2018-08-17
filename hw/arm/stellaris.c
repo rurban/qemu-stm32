@@ -21,6 +21,7 @@
 #include "exec/address-spaces.h"
 #include "sysemu/sysemu.h"
 #include "hw/char/pl011.h"
+#include "hw/arm/arm.h"
 
 #define GPIO_A 0
 #define GPIO_B 1
@@ -1220,10 +1221,10 @@ static void stellaris_init(const char *kernel_filename, const char *cpu_model,
         0x40024000, 0x40025000, 0x40026000};
     static const int gpio_irq[7] = {0, 1, 2, 3, 4, 30, 31};
 
-    DeviceState *gpio_dev[7], *nvic;
+    DeviceState *gpio_dev[7];
+    ARMCPU *cpu;
     qemu_irq gpio_in[7][8];
     qemu_irq gpio_out[7][8];
-    qemu_irq adc;
     int sram_size;
     int flash_size;
     I2CBus *i2c;
@@ -1250,12 +1251,12 @@ static void stellaris_init(const char *kernel_filename, const char *cpu_model,
     vmstate_register_ram_global(sram);
     memory_region_add_subregion(system_memory, 0x20000000, sram);
 
-    nvic = armv7m_init(system_memory, flash_size, NUM_IRQ_LINES,
+    cpu = armv7m_init(system_memory, 0, flash_size, NUM_IRQ_LINES,
                       kernel_filename, cpu_model);
+    DeviceState *nvic = NULL; //cpu->nvic;
 
     qdev_connect_gpio_out_named(nvic, "SYSRESETREQ", 0,
                                 qemu_allocate_irq(&do_sys_reset, NULL, 0));
-
     if (board->dc1 & (1 << 16)) {
         dev = sysbus_create_varargs(TYPE_STELLARIS_ADC, 0x40038000,
                                     qdev_get_gpio_in(nvic, 14),
@@ -1263,23 +1264,22 @@ static void stellaris_init(const char *kernel_filename, const char *cpu_model,
                                     qdev_get_gpio_in(nvic, 16),
                                     qdev_get_gpio_in(nvic, 17),
                                     NULL);
-        adc = qdev_get_gpio_in(dev, 0);
+        //adc = qdev_get_gpio_in(dev, 0);
     } else {
-        adc = NULL;
+        //adc = NULL;
     }
     for (i = 0; i < 4; i++) {
         if (board->dc2 & (0x10000 << i)) {
             dev = sysbus_create_simple(TYPE_STELLARIS_GPTM,
                                        0x40030000 + i * 0x1000,
                                        qdev_get_gpio_in(nvic, timer_irq[i]));
-            /* TODO: This is incorrect, but we get away with it because
-               the ADC output is only ever pulsed.  */
-            qdev_connect_gpio_out(dev, 0, adc);
+            //qdev_connect_gpio_out(dev, 0, adc);
         }
     }
 
     stellaris_sys_init(0x400fe000, qdev_get_gpio_in(nvic, 28),
                        board, nd_table[0].macaddr.a);
+
 
     for (i = 0; i < 7; i++) {
         if (board->dc4 & (1 << i)) {
@@ -1370,6 +1370,7 @@ static void stellaris_init(const char *kernel_filename, const char *cpu_model,
             }
         }
     }
+    (void)cpu;
 }
 
 /* FIXME: Figure out how to generate these from stellaris_boards.  */

@@ -37,7 +37,7 @@ void notifier_list_notify(NotifierList *list, void *data)
     Notifier *notifier, *next;
 
     QLIST_FOREACH_SAFE(notifier, &list->notifiers, node, next) {
-        notifier->notify(notifier, data);
+        if(notifier && notifier->notify) notifier->notify(notifier, data);
     }
 }
 

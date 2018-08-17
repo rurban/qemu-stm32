@@ -24,7 +24,7 @@ typedef enum {
 } arm_endianness;
 
 /* armv7m.c */
-DeviceState *armv7m_init(MemoryRegion *system_memory, int mem_size, int num_irq,
+ARMCPU *armv7m_init(MemoryRegion *system_memory, hwaddr flash_base, int mem_size, int num_irq,
                       const char *kernel_filename, const char *cpu_model);
 
 /*

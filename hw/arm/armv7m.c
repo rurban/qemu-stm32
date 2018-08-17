@@ -170,20 +170,22 @@ static void armv7m_reset(void *opaque)
    mem_size is in bytes.
    Returns the NVIC array.  */
 
-DeviceState *armv7m_init(MemoryRegion *system_memory, int mem_size, int num_irq,
+ARMCPU *armv7m_init(MemoryRegion *system_memory, hwaddr flash_base, int mem_size, int num_irq,
                       const char *kernel_filename, const char *cpu_model)
 {
     ARMCPU *cpu;
     CPUARMState *env;
     DeviceState *nvic;
+    /*
     int image_size;
     uint64_t entry;
     uint64_t lowaddr;
-    int big_endian;
+    */
+    int __attribute__((unused)) big_endian;
     MemoryRegion *hack = g_new(MemoryRegion, 1);
 
     if (cpu_model == NULL) {
-	cpu_model = "cortex-m3";
+	    cpu_model = "cortex-m3";
     }
     cpu = cpu_arm_init(cpu_model);
     if (cpu == NULL) {
@@ -194,7 +196,7 @@ DeviceState *armv7m_init(MemoryRegion *system_memory, int mem_size, int num_irq,
 
     armv7m_bitband_init();
 
-    nvic = qdev_create(NULL, "armv7m_nvic");
+    cpu->nvic = nvic = qdev_create(NULL, "armv7m_nvic");
     qdev_prop_set_uint32(nvic, "num-irq", num_irq);
     env->nvic = nvic;
     qdev_init_nofail(nvic);
@@ -206,16 +208,18 @@ DeviceState *armv7m_init(MemoryRegion *system_memory, int mem_size, int num_irq,
 #else
     big_endian = 0;
 #endif
-
+/*
     if (!kernel_filename && !qtest_enabled()) {
         fprintf(stderr, "Guest image must be specified (using -kernel)\n");
         exit(1);
     }
 
     if (kernel_filename) {
-        image_size = load_elf(kernel_filename, NULL, NULL, &entry, &lowaddr,
+        uint64_t entry = 0, lowaddr = 0;
+        int image_size = load_elf(kernel_filename, NULL, NULL, &entry, &lowaddr,
                               NULL, big_endian, EM_ARM, 1, 0);
         if (image_size < 0) {
+            fprintf(stderr, "Could not load elf kernel, trying binary!\n");
             image_size = load_image_targphys(kernel_filename, 0, mem_size);
             lowaddr = 0;
         }
@@ -224,7 +228,7 @@ DeviceState *armv7m_init(MemoryRegion *system_memory, int mem_size, int num_irq,
             exit(1);
         }
     }
-
+*/
     /* Hack to map an additional page of ram at the top of the address
        space.  This stops qemu complaining about executing code outside RAM
        when returning from an exception.  */
@@ -233,7 +237,8 @@ DeviceState *armv7m_init(MemoryRegion *system_memory, int mem_size, int num_irq,
     memory_region_add_subregion(system_memory, 0xfffff000, hack);
 
     qemu_register_reset(armv7m_reset, cpu);
-    return nvic;
+
+    return cpu;
 }
 
 static Property bitband_properties[] = {
