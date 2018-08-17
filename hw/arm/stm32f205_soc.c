@@ -114,7 +114,7 @@ static void stm32f205_soc_realize(DeviceState *dev_soc, Error **errp)
 
     ARMCPU *cpu = armv7m_init(get_system_memory(), FLASH_BASE_ADDRESS, FLASH_SIZE, 96,
                        s->kernel_filename, s->cpu_model);
-    DeviceState *nvic = cpu->nvic;
+    DeviceState *nvic = cpu->env.nvic;
 
     /* System configuration controller */
     dev = DEVICE(&s->syscfg);
@@ -142,7 +142,6 @@ static void stm32f205_soc_realize(DeviceState *dev_soc, Error **errp)
         sysbus_connect_irq(busdev, 0, qdev_get_gpio_in(nvic, usart_irq[i]));
     }
 
-    /* Timer 2 to 5 */
     for (i = 0; i < STM_NUM_TIMERS; i++) {
         dev = DEVICE(&(s->timer[i]));
         qdev_prop_set_uint64(dev, "clock-frequency", 1000000000);

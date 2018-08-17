@@ -30,19 +30,32 @@
 #include "hw/arm/stm32f10x_soc.h"
 #include "hw/arm/arm.h"
 
-static void stm32f10x_duino_init(MachineState *machine)
-{
-    //object_property_set_bool(OBJECT(dev), true, "realized", &error_fatal);
+struct stm32f10x_duino {
+    struct stm32f10x_soc *cpu;
+    struct arm_boot_info boot_info;
+};
 
-    struct stm32f10x_soc *cpu = stm32f10x_soc_init(machine->kernel_filename);
+static void stm32f10x_duino_init(MachineState *machine) {
+    printf("stm32f10x_duino init\n");
+    struct stm32f10x_duino *s = g_new0(struct stm32f10x_duino, 1);
 
-    struct arm_boot_info binfo;
-    binfo.ram_size = 1024*20;
-    binfo.kernel_filename = machine->kernel_filename;
-    binfo.kernel_cmdline = "";
-    binfo.initrd_filename = "";
-    binfo.loader_start = 0x08000000;
-    arm_load_kernel(cpu->cpu, &binfo);
+    if (!machine->kernel_filename) {
+        fprintf(stderr, "Guest image must be specified (using -kernel)\n");
+        exit(1);
+    }
+
+    s->cpu = STM32F10X_SOC(object_new(TYPE_STM32F10X_SOC));
+    object_property_set_str(OBJECT(s->cpu), machine->cpu_model, "cpu-model", &error_abort);
+    object_property_set_str(OBJECT(s->cpu), machine->kernel_filename, "kernel-filename", &error_abort);
+    object_property_set_bool(OBJECT(s->cpu), true, "realized", &error_fatal);
+
+    memset(&s->boot_info, 0, sizeof(s->boot_info));
+    s->boot_info.ram_size = 1024*20;
+    s->boot_info.kernel_filename = machine->kernel_filename;
+    s->boot_info.kernel_cmdline = NULL;
+    s->boot_info.initrd_filename = NULL;
+
+    arm_load_kernel(ARM_CPU(first_cpu), &s->boot_info);
 }
 
 static void stm32f10x_duino_machine_init(MachineClass *mc)

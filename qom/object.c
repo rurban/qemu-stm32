@@ -355,8 +355,16 @@ void object_initialize_with_type(void *data, size_t size, TypeImpl *type)
 {
     Object *obj = data;
 
+    if(!type){
+        fprintf(stderr, "Unknown type %s\n", type->name);
+    }
+
     g_assert(type != NULL);
     type_initialize(type);
+
+    if(size < type->instance_size){
+        fprintf(stderr, "Size mismatch for %s\n", type->name);
+    }
 
     g_assert_cmpint(type->instance_size, >=, sizeof(Object));
     g_assert(type->abstract == false);
@@ -374,7 +382,6 @@ void object_initialize_with_type(void *data, size_t size, TypeImpl *type)
 void object_initialize(void *data, size_t size, const char *typename)
 {
     TypeImpl *type = type_get_by_name(typename);
-
     object_initialize_with_type(data, size, type);
 }
 

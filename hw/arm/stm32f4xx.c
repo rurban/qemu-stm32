@@ -191,8 +191,8 @@ void stm32f4xx_init(
 
     /* EXTI */
     DeviceState *exti_dev = qdev_create(NULL, "stm32_exti");
-    qdev_prop_set_ptr(exti_dev, "stm32_gpio", gpio_dev);
-    stm32_init_periph(exti_dev, STM32_EXTI_PERIPH, 0x40013C00, NULL);
+    //qdev_prop_set_ptr(exti_dev, "stm32_gpio", gpio_dev);
+    stm32_init_periph(exti_dev, STM32_EXTI_PERIPH, EXTI_BASE, NULL);
     SysBusDevice *exti_busdev = SYS_BUS_DEVICE(exti_dev);
     
     /* IRQs from EXTI to NVIC */

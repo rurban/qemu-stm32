@@ -174,7 +174,6 @@ ARMCPU *armv7m_init(MemoryRegion *system_memory, hwaddr flash_base, int mem_size
                       const char *kernel_filename, const char *cpu_model)
 {
     ARMCPU *cpu;
-    CPUARMState *env;
     DeviceState *nvic;
     /*
     int image_size;
@@ -182,7 +181,6 @@ ARMCPU *armv7m_init(MemoryRegion *system_memory, hwaddr flash_base, int mem_size
     uint64_t lowaddr;
     */
     int __attribute__((unused)) big_endian;
-    MemoryRegion *hack = g_new(MemoryRegion, 1);
 
     if (cpu_model == NULL) {
 	    cpu_model = "cortex-m3";
@@ -192,13 +190,11 @@ ARMCPU *armv7m_init(MemoryRegion *system_memory, hwaddr flash_base, int mem_size
         fprintf(stderr, "Unable to find CPU definition\n");
         exit(1);
     }
-    env = &cpu->env;
 
     armv7m_bitband_init();
 
-    cpu->nvic = nvic = qdev_create(NULL, "armv7m_nvic");
+    nvic = cpu->env.nvic = qdev_create(NULL, "armv7m_nvic");
     qdev_prop_set_uint32(nvic, "num-irq", num_irq);
-    env->nvic = nvic;
     qdev_init_nofail(nvic);
     sysbus_connect_irq(SYS_BUS_DEVICE(nvic), 0,
                        qdev_get_gpio_in(DEVICE(cpu), ARM_CPU_IRQ));
@@ -228,10 +224,12 @@ ARMCPU *armv7m_init(MemoryRegion *system_memory, hwaddr flash_base, int mem_size
             exit(1);
         }
     }
-*/
+    */
     /* Hack to map an additional page of ram at the top of the address
        space.  This stops qemu complaining about executing code outside RAM
        when returning from an exception.  */
+
+    MemoryRegion *hack = g_new(MemoryRegion, 1);
     memory_region_init_ram(hack, NULL, "armv7m.hack", 0x1000, &error_fatal);
     vmstate_register_ram_global(hack);
     memory_region_add_subregion(system_memory, 0xfffff000, hack);

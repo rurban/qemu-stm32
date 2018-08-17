@@ -69,20 +69,38 @@ static const struct stm32_periph_def _spi_def[STM32F10X_NUM_SPIS] = {
     { .base = SPI3_BASE, .irq = SPI3_IRQn }
 };
 
-struct stm32f10x_soc *stm32f10x_soc_init(const char *kernel_filename) {
-    struct stm32f10x_soc *s = g_new0(struct stm32f10x_soc, 1);
-    DeviceState *dev;
-    SysBusDevice *busdev;
-    Error *err = NULL;
+static void stm32f10x_soc_initfn(Object *obj){
+    struct stm32f10x_soc *s = STM32F10X_SOC(obj);
     int i;
 
-    object_initialize(&s->syscfg, sizeof(s->syscfg), TYPE_STM32F2XX_SYSCFG);
+    fprintf(stderr, "stm32f10x_soc init\n");
+
+       object_initialize(&s->syscfg, sizeof(s->syscfg), TYPE_STM32F2XX_SYSCFG);
     qdev_set_parent_bus(DEVICE(&s->syscfg), sysbus_get_default());
 
+    DeviceState *rcc = qdev_create(NULL, "stm32f2xx_rcc");
+    qdev_prop_set_uint32(rcc, "osc_freq", 8000000);
+    qdev_prop_set_uint32(rcc, "osc32_freq", 32000);
+    qdev_init_nofail(rcc);
+    object_property_add_child(obj, "rcc", OBJECT(rcc), NULL);
+    s->rcc = SYS_BUS_DEVICE(rcc);
+/*
+    DeviceState *syscfg_dev = qdev_create(NULL, "stm32f2xx_syscfg");
+    qdev_prop_set_ptr(syscfg_dev, "stm32_rcc", rcc_dev);
+    qdev_prop_set_ptr(syscfg_dev, "stm32_exti", exti_dev);
+    qdev_prop_set_bit(syscfg_dev, "boot0", 0);
+    qdev_prop_set_bit(syscfg_dev, "boot1", 0);
+*/
     for (i = 0; i < STM32F10X_NUM_UARTS; i++) {
-        object_initialize(&s->usart[i], sizeof(s->usart[i]),
-                          TYPE_STM32F2XX_USART);
-        qdev_set_parent_bus(DEVICE(&s->usart[i]), sysbus_get_default());
+        //s->usart[i] = SYS_BUS_DEVICE(object_new("stm32f10x-uart"));
+        s->usart[i] = SYS_BUS_DEVICE(object_new("stm32f2xx-usart"));
+        char name[16];
+        snprintf(name, sizeof(name), "uart%d", i);
+        object_property_add_child(obj, name, OBJECT(s->usart[i]), NULL);
+        qdev_set_parent_bus(DEVICE(s->usart[i]), sysbus_get_default());
+
+        //object_initialize(&s->usart[i], sizeof(s->usart[i]), "stm32f10x-uart");
+        //qdev_set_parent_bus(DEVICE(&s->usart[i]), sysbus_get_default());
     }
 
     for (i = 0; i < STM32F10X_NUM_TIMERS; i++) {
@@ -105,14 +123,42 @@ struct stm32f10x_soc *stm32f10x_soc_init(const char *kernel_filename) {
         qdev_set_parent_bus(DEVICE(&s->spi[i]), sysbus_get_default());
     }
 
+}
+
+static void stm32f10x_soc_realize(DeviceState *dev_soc, Error **errp) {
+    struct stm32f10x_soc *s = STM32F10X_SOC(dev_soc);
+    DeviceState *dev;
+    SysBusDevice *busdev;
+    Error *err = NULL;
+    int i;
+
+    printf("stm32f10x_soc realize\n");
+    /*
+    ObjectClass *cpu_oc = cpu_class_by_name(TYPE_ARM_CPU, s->cpu_model);
+    if (!cpu_oc) {
+        fprintf(stderr, "Unable to find CPU definition for %s\n", s->cpu_model);
+        exit(1);
+    }
+
+    Object *cpuobj = object_new(object_class_get_name(cpu_oc));
+    if(!cpuobj){
+        fprintf(stderr, "Could not create cpu!\n");
+        exit(1);
+    }
+    object_property_set_bool(cpuobj, true, "realized", &error_fatal);
+    */
+
+    printf("created cpu %s:%s\n", TYPE_ARM_CPU, s->cpu_model);
+
     MemoryRegion *system_memory = get_system_memory();
     MemoryRegion *sram = g_new(MemoryRegion, 1);
     MemoryRegion *flash = g_new(MemoryRegion, 1);
     MemoryRegion *flash_alias = g_new(MemoryRegion, 1);
 
     memory_region_init_ram(flash, NULL, "STM32F10x.flash", FLASH_SIZE, &error_fatal);
-    vmstate_register_ram_global(flash);
     memory_region_init_alias(flash_alias, NULL, "STM32F10x.flash.alias", flash, 0, FLASH_SIZE);
+
+    vmstate_register_ram_global(flash);
 
     memory_region_set_readonly(flash, true);
     memory_region_set_readonly(flash_alias, true);
@@ -124,56 +170,42 @@ struct stm32f10x_soc *stm32f10x_soc_init(const char *kernel_filename) {
     vmstate_register_ram_global(sram);
     memory_region_add_subregion(system_memory, SRAM_BASE_ADDRESS, sram);
 
-    printf("armv7m init: %s\n", kernel_filename);
     s->cpu = armv7m_init(get_system_memory(), FLASH_BASE_ADDRESS, FLASH_SIZE, 96,
-                       kernel_filename, s->cpu_model);
-    DeviceState *nvic = s->cpu->nvic;
-    //armv7m = DEVICE(&s->armv7m);
-    /*
-    qdev_prop_set_uint32(armv7m, "num-irq", 96);
-    qdev_prop_set_string(armv7m, "cpu-model", s->cpu_model);
-    object_property_set_link(OBJECT(armv7m), OBJECT(get_system_memory()),
-                                     "memory", &error_abort);
-    object_property_set_bool(OBJECT(armv7m), true, "realized", &err);
+                       s->kernel_filename, s->cpu_model);
+    DeviceState *nvic = s->cpu->env.nvic;
+
+    object_property_set_bool(OBJECT(&s->syscfg), true, "realized", &err);
     if (err != NULL) {
         error_propagate(errp, err);
-        return;
+        return ;
     }
-    */
+    sysbus_mmio_map(s->rcc, 0, 0x40023800);
+    sysbus_connect_irq(s->rcc, 0, qdev_get_gpio_in(nvic, RCC_IRQn));
 
     /* System configuration controller */
     dev = DEVICE(&s->syscfg);
     object_property_set_bool(OBJECT(&s->syscfg), true, "realized", &err);
     if (err != NULL) {
-        //error_propagate(errp, err);
-        return 0;
+        error_propagate(errp, err);
+        return ;
     }
     busdev = SYS_BUS_DEVICE(dev);
     sysbus_mmio_map(busdev, 0, 0x40013800);
-    //sysbus_connect_irq(busdev, 0, qdev_get_gpio_in(s->nvic, 71));
+    sysbus_connect_irq(busdev, 0, qdev_get_gpio_in(nvic, SYSCFG_IRQn));
 
     /* Attach UART (uses USART registers) and USART controllers */
     for (i = 0; i < STM32F10X_NUM_UARTS; i++) {
-        dev = DEVICE(&(s->usart[i]));
+        if(!_uart_def[i].base) continue;
 
-        if (i < MAX_SERIAL_PORTS) {
-            CharDriverState *chr;
+        dev = DEVICE(s->usart[i]);
+        qdev_prop_set_chr(dev, "chardev",
+                          i < MAX_SERIAL_PORTS ? serial_hds[i] : NULL);
 
-            chr = serial_hds[i];
+        object_property_set_bool(OBJECT(s->usart[i]), true, "realized", &err);
 
-            if (!chr) {
-                char label[20];
-                snprintf(label, sizeof(label), "stm32.uart%d", i);
-                chr = qemu_chr_new(label, "null");
-            }
-
-            qdev_prop_set_chr(dev, "chardev", chr);
-        }
-
-        object_property_set_bool(OBJECT(&s->usart[i]), true, "realized", &err);
         if (err != NULL) {
-            //error_propagate(errp, err);
-            return 0;
+            error_propagate(errp, err);
+            return ;
         }
         busdev = SYS_BUS_DEVICE(dev);
         sysbus_mmio_map(busdev, 0, _uart_def[i].base);
@@ -182,35 +214,37 @@ struct stm32f10x_soc *stm32f10x_soc_init(const char *kernel_filename) {
 
     /* Timer 2 to 5 */
     for (i = 0; i < STM32F10X_NUM_TIMERS; i++) {
+        if(!_timer_def[i].base) continue;
+
         dev = DEVICE(&(s->timer[i]));
         qdev_prop_set_uint64(dev, "clock-frequency", 1000000000);
         object_property_set_bool(OBJECT(&s->timer[i]), true, "realized", &err);
         if (err != NULL) {
-            //error_propagate(errp, err);
-            return 0;
+            error_propagate(errp, err);
+            return ;
         }
         busdev = SYS_BUS_DEVICE(dev);
         sysbus_mmio_map(busdev, 0, _timer_def[i].base);
         sysbus_connect_irq(busdev, 0, qdev_get_gpio_in(nvic, _timer_def[i].irq));
     }
-
     /* ADC 1 to 3 */
     object_property_set_int(OBJECT(s->adc_irqs), STM32F10X_NUM_ADCS,
                             "num-lines", &err);
     object_property_set_bool(OBJECT(s->adc_irqs), true, "realized", &err);
     if (err != NULL) {
-        //error_propagate(errp, err);
-        return 0;
+        error_propagate(errp, err);
+        return ;
     }
     qdev_connect_gpio_out(DEVICE(s->adc_irqs), 0,
                           qdev_get_gpio_in(nvic, _adc_def[i].irq));
 
     for (i = 0; i < STM32F10X_NUM_ADCS; i++) {
+        if(!_adc_def[i].base) continue;
         dev = DEVICE(&(s->adc[i]));
         object_property_set_bool(OBJECT(&s->adc[i]), true, "realized", &err);
         if (err != NULL) {
             //error_propagate(errp, err);
-            return 0;
+            return ;
         }
         busdev = SYS_BUS_DEVICE(dev);
         sysbus_mmio_map(busdev, 0, _adc_def[i].base);
@@ -220,47 +254,44 @@ struct stm32f10x_soc *stm32f10x_soc_init(const char *kernel_filename) {
 
     /* SPI 1 and 2 */
     for (i = 0; i < STM32F10X_NUM_SPIS; i++) {
+        if(!_spi_def[i].base) continue;
         dev = DEVICE(&(s->spi[i]));
         object_property_set_bool(OBJECT(&s->spi[i]), true, "realized", &err);
         if (err != NULL) {
             //error_propagate(errp, err);
-            return 0;
+            return ;
         }
         busdev = SYS_BUS_DEVICE(dev);
         sysbus_mmio_map(busdev, 0, _spi_def[i].base);
         sysbus_connect_irq(busdev, 0, qdev_get_gpio_in(nvic, _spi_def[i].irq));
     }
-
-    return s;
 }
 
-/*
-static Property stm32f205_soc_properties[] = {
+static Property stm32f10x_soc_properties[] = {
     DEFINE_PROP_STRING("cpu-model", struct stm32f10x_soc, cpu_model),
     DEFINE_PROP_STRING("kernel-filename", struct stm32f10x_soc, kernel_filename),
     DEFINE_PROP_END_OF_LIST(),
 };
 
-static void stm32f205_soc_class_init(ObjectClass *klass, void *data)
+static void stm32f10x_soc_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->realize = stm32f205_soc_realize;
-    dc->props = stm32f205_soc_properties;
+    dc->realize = stm32f10x_soc_realize;
+    dc->props = stm32f10x_soc_properties;
 }
 
-static const TypeInfo stm32f205_soc_info = {
+static const TypeInfo stm32f10x_soc_info = {
     .name          = TYPE_STM32F10X_SOC,
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(struct stm32f10x_soc),
-    .instance_init = stm32f205_soc_initfn,
-    .class_init    = stm32f205_soc_class_init,
+    .instance_init = stm32f10x_soc_initfn,
+    .class_init    = stm32f10x_soc_class_init,
 };
 
-static void stm32f205_soc_types(void)
+static void stm32f10x_soc_types(void)
 {
-    type_register_static(&stm32f205_soc_info);
+    type_register_static(&stm32f10x_soc_info);
 }
 
-type_init(stm32f205_soc_types)
-*/
+type_init(stm32f10x_soc_types)

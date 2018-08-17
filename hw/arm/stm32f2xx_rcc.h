@@ -1,7 +1,10 @@
+#pragma once
+
 #include "hw/sysbus.h"
 #include "hw/arm/stm32_clktree.h"
 #include "stm32f2xx.h"
-#include "stm32_rcc.h"
+#include "stm32f10x_rcc.h"
+#include "stm32f2xx_rcc.h"
 
 typedef struct Stm32f2xxRcc {
     /* Inherited */

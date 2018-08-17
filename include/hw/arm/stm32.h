@@ -396,24 +396,23 @@ typedef struct Stm32F7xxLPTimer Stm32F7xxLPTimer;
 /* UART */
 #define STM32_UART_COUNT 5
 
-typedef struct Stm32Uart Stm32Uart;
-
-#define TYPE_STM32_UART "stm32-uart"
-#define STM32_UART(obj) OBJECT_CHECK(Stm32Uart, (obj), TYPE_STM32_UART)
+struct stm32f10x_uart;
+#define TYPE_STM32_UART "stm32f10x-uart"
+#define STM32F10X_UART(obj) OBJECT_CHECK(struct stm32f10x_uart, (obj), TYPE_STM32_UART)
 
 /* Connects the character driver to the specified UART.  The
  * board's pin mapping should be passed in.  This will be used to
  * verify the correct mapping is configured by the software.
  */
-void stm32_uart_connect(Stm32Uart *s, CharDriverState *chr,
+void stm32_uart_connect(struct stm32f10x_uart *s, CharDriverState *chr,
                         uint32_t afio_board_map);
 
 /* Low level methods that let you connect a UART device to any other instance
  * that has read/write handlers. These can be used in place of stm32_uart_connect
  * if not connecting to a CharDriverState instance. */
-void stm32_uart_set_write_handler(Stm32Uart *s, void *obj,
+void stm32_uart_set_write_handler(struct stm32f10x_uart *s, void *obj,
         int (*chr_write_handler)(void *chr_write_obj, const uint8_t *buf, int len));
-void stm32_uart_get_rcv_handlers(Stm32Uart *s, IOCanReadHandler **can_read,
+void stm32_uart_get_rcv_handlers(struct stm32f10x_uart *s, IOCanReadHandler **can_read,
                                  IOReadHandler **read, IOEventHandler **event);
 
 void stm32_create_uart_dev(
@@ -482,7 +481,7 @@ typedef struct Stm32Afio Stm32Afio;
  * of the mapping values defined above. */
 uint32_t stm32_afio_get_periph_map(Stm32Afio *s, int32_t periph_num);
 
-void stm32_afio_uart_check_tx_pin_callback(Stm32Uart *s);
+void stm32_afio_uart_check_tx_pin_callback(struct stm32f10x_uart *s);
 
 
 
@@ -502,7 +501,7 @@ void stm32f1xx_init(
             ram_addr_t ram_size,
             const char *kernel_filename,
             Stm32Gpio **stm32_gpio,
-            Stm32Uart **stm32_uart,
+            struct stm32f10x_uart **stm32_uart,
             uint32_t osc_freq,
             uint32_t osc32_freq);
 
@@ -512,7 +511,7 @@ void stm32f2xx_init(
                     ram_addr_t ram_size,
                     const char *kernel_filename,
                     Stm32Gpio **stm32_gpio,
-                    Stm32Uart **stm32_uart,
+                    struct stm32f10x_uart **stm32_uart,
                     Stm32Timer **stm32_timer,
                     DeviceState **stm32_rtc,
                     uint32_t osc_freq,
@@ -527,7 +526,7 @@ void stm32f4xx_init(
                     const char *kernel_filename,
                     Stm32Gpio **stm32_gpio,
                     const uint32_t *gpio_idr_masks,
-                    Stm32Uart **stm32_uart,
+                    struct stm32f10x_uart **stm32_uart,
                     Stm32Timer **stm32_timer,
                     DeviceState **stm32_rtc,
                     uint32_t osc_freq,

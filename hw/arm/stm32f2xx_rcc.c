@@ -34,7 +34,7 @@
 /* DEFINITIONS*/
 
 /* See README for DEBUG details. */
-//#define DEBUG_STM32_RCC
+#define DEBUG_STM32_RCC
 
 #ifdef DEBUG_STM32_RCC
 #define DPRINTF(fmt, ...)                                       \
@@ -371,7 +371,7 @@ static void stm32_rcc_RCC_CR_write(Stm32f2xxRcc *s, uint32_t new_value, bool ini
     new_PLLON = IS_BIT_SET(new_value, RCC_CR_PLLON_BIT);
     if((clktree_is_enabled(s->PLLCLK) && !new_PLLON) &&
        s->RCC_CFGR_SW == SW_PLL_SELECTED) {
-        stm32_hw_warn("PLL cannot be disabled while it is selected as the system clock.");
+        printf("PLL cannot be disabled while it is selected as the system clock.");
     }
     clktree_set_enabled(s->PLLCLK, new_PLLON);
 
@@ -379,7 +379,7 @@ static void stm32_rcc_RCC_CR_write(Stm32f2xxRcc *s, uint32_t new_value, bool ini
     if((clktree_is_enabled(s->HSECLK) && !new_HSEON) &&
        (s->RCC_CFGR_SW == SW_HSE_SELECTED || s->RCC_CFGR_SW == SW_PLL_SELECTED)
        ) {
-        stm32_hw_warn("HSE oscillator cannot be disabled while it is driving the system clock.");
+        printf("HSE oscillator cannot be disabled while it is driving the system clock.");
     }
     clktree_set_enabled(s->HSECLK, new_HSEON);
 
@@ -387,7 +387,7 @@ static void stm32_rcc_RCC_CR_write(Stm32f2xxRcc *s, uint32_t new_value, bool ini
     if((clktree_is_enabled(s->HSECLK) && !new_HSEON) &&
        (s->RCC_CFGR_SW == SW_HSI_SELECTED || s->RCC_CFGR_SW == SW_PLL_SELECTED)
        ) {
-        stm32_hw_warn("HSI oscillator cannot be disabled while it is driving the system clock.");
+        printf("HSI oscillator cannot be disabled while it is driving the system clock.");
     }
     clktree_set_enabled(s->HSICLK, new_HSION);
 
@@ -431,13 +431,13 @@ static void stm32_rcc_RCC_PLLCFGR_write(Stm32f2xxRcc *s, uint32_t new_value, boo
         if (are_disabled == false) {
             const char *warning_fmt = "Can only change %s while PLL and PLLI2S are disabled";
             if (new_PLLM != s->RCC_PLLCFGR_PLLM) {
-                stm32_hw_warn(warning_fmt, "PLLM");
+                printf(warning_fmt, "PLLM");
             }
             if (new_PLLN != s->RCC_PLLCFGR_PLLN) {
-                stm32_hw_warn(warning_fmt, "PLLN");
+                printf(warning_fmt, "PLLN");
             }
             if (new_PLLSRC != s->RCC_PLLCFGR_PLLSRC) {
-                stm32_hw_warn(warning_fmt, "PLLSRC");
+                printf(warning_fmt, "PLLSRC");
             }
         }
     }
@@ -494,13 +494,13 @@ static void stm32_rcc_RCC_PLLI2SCFGR_write(Stm32f2xxRcc *s, uint32_t new_value, 
         if (are_disabled == false) {
             const char *warning_fmt = "Can only change %s while PLL and PLLI2S are disabled";
             if (new_PLLR != s->RCC_PLLI2SCFGR_PLLR) {
-                stm32_hw_warn(warning_fmt, "PLLR");
+                printf(warning_fmt, "PLLR");
             }
             if (new_PLLQ != s->RCC_PLLI2SCFGR_PLLQ) {
-                stm32_hw_warn(warning_fmt, "PLLQ");
+                printf(warning_fmt, "PLLQ");
             }
             if (new_PLLN != s->RCC_PLLCFGR_PLLN) {
-                stm32_hw_warn(warning_fmt, "PLLN");
+                printf(warning_fmt, "PLLN");
             }
         }
     }
@@ -898,7 +898,7 @@ static uint64_t stm32_rcc_read(void *opaque, hwaddr offset,
         case 4:
             return stm32_rcc_readw(opaque, offset);
         default:
-            stm32_unimp("Unimplemented: RCC read from register at offset %lld", offset);
+            stm32_unimp("Unimplemented: RCC read from register at offset %lu", offset);
             return 0;
     }
 }
@@ -946,13 +946,12 @@ static void stm32_rcc_hclk_upd_irq_handler(void *opaque, int n, int level)
     Stm32f2xxRcc *s = (Stm32f2xxRcc *)opaque;
 
     uint32_t hclk_freq = 0;
-    uint32_t ext_ref_freq = 0;
     
     hclk_freq = clktree_get_output_freq(s->HCLK);
 
     /* Only update the scales if the frequency is not zero. */
     if (hclk_freq > 0) {
-        ext_ref_freq = hclk_freq / 8;
+        //ext_ref_freq = hclk_freq / 8;
 
         /* Update the scales - these are the ratio of QEMU clock ticks
          * (which is an unchanging number independent of the CPU frequency) to
