@@ -147,6 +147,7 @@ int load_image_targphys_as(const char *filename,
 
     size = get_image_size(filename);
     if (size > max_sz) {
+        fprintf(stderr, "Image too large (%d > %lu)\n", size, max_sz);
         return -1;
     }
     if (size > 0) {

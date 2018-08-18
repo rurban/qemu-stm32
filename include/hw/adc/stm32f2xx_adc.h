@@ -46,13 +46,12 @@
 #define ADC_JDR4  0x48
 #define ADC_DR    0x4C
 
+/*
 #define ADC_CR2_ADON    0x01
 #define ADC_CR2_CONT    0x02
 #define ADC_CR2_ALIGN   0x800
 #define ADC_CR2_SWSTART 0x40000000
-
-#define ADC_CR1_RES 0x3000000
-
+*/
 #define ADC_COMMON_ADDRESS 0x100
 
 #define TYPE_STM32F2XX_ADC "stm32f2xx-adc"
