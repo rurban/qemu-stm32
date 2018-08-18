@@ -28,6 +28,7 @@
 #include "hw/boards.h"
 #include "qemu/error-report.h"
 #include "hw/arm/arm.h"
+#include "hw/arm/armv7m.h"
 
 struct stm32f10x_duino {
     DeviceState *soc;
@@ -44,7 +45,7 @@ static void stm32f10x_duino_init(MachineState *machine) {
     }
 
     s->soc = qdev_create(NULL, "stm32f10x-soc");
-    qdev_prop_set_string(s->soc, "cpu-model", machine->cpu_model);
+    qdev_prop_set_string(s->soc, "cpu-type", ARM_CPU_TYPE_NAME("cortex-m3"));
     object_property_set_bool(OBJECT(s->soc), true, "realized", &error_fatal);
 
     armv7m_load_kernel(ARM_CPU(first_cpu), machine->kernel_filename, 2 * 1024 * 1024);

@@ -27,7 +27,7 @@
 #include "qemu-common.h"
 #include "hw/sysbus.h"
 #include "qemu/log.h"
-#include "sysemu/char.h"
+#include "chardev/char-fe.h"
 
 
 #define ENUM_STRING(x) [x] = #x

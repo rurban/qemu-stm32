@@ -28,6 +28,7 @@
 #include "hw/boards.h"
 #include "qemu/error-report.h"
 #include "hw/arm/arm.h"
+#include "hw/arm/armv7m.h"
 #include "exec/address-spaces.h"
 
 struct stm32f429i_disco {
@@ -36,7 +37,6 @@ struct stm32f429i_disco {
 };
 
 static void stm32f429i_disco_init(MachineState *machine) {
-    printf("stm32f429i_disco init\n");
     struct stm32f429i_disco *s = g_new0(struct stm32f429i_disco, 1);
 
     if (!machine->kernel_filename) {
@@ -45,7 +45,7 @@ static void stm32f429i_disco_init(MachineState *machine) {
     }
 
     s->soc = qdev_create(NULL, "stm32f4xx-soc");
-    qdev_prop_set_string(s->soc, "cpu-model", machine->cpu_model);
+    qdev_prop_set_string(s->soc, "cpu-type", ARM_CPU_TYPE_NAME("cortex-m4"));
     object_property_set_bool(OBJECT(s->soc), true, "realized", &error_fatal);
 
     // Add the sram

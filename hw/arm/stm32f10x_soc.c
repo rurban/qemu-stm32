@@ -231,15 +231,14 @@ static void stm32f10x_soc_realize(DeviceState *dev_soc, Error **errp) {
         if(!_uart_def[i].base) continue;
 
         dev = DEVICE(s->usart[i]);
-        qdev_prop_set_chr(dev, "chardev",
-                          i < MAX_SERIAL_PORTS ? serial_hds[i] : NULL);
 
+        qdev_prop_set_chr(dev, "chardev", serial_hd(i));
         object_property_set_bool(OBJECT(s->usart[i]), true, "realized", &err);
-
         if (err != NULL) {
             error_propagate(errp, err);
             return ;
         }
+
         busdev = SYS_BUS_DEVICE(dev);
         sysbus_mmio_map(busdev, 0, _uart_def[i].base);
         sysbus_connect_irq(busdev, 0, qdev_get_gpio_in(armv7m, _uart_def[i].irq));

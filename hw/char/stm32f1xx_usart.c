@@ -26,7 +26,7 @@
 #include "qemu/osdep.h"
 #include "qemu/log.h"
 #include "hw/sysbus.h"
-#include "sysemu/char.h"
+#include "chardev/char-fe.h"
 #include "hw/hw.h"
 
 #define USART_SR   0x00
@@ -112,9 +112,9 @@ static void _update_irq(struct stm32f1xx_usart *s){
 
     if(s->irq_level != level){
         if(level) {
-            printf("irq on\n");
+            DB_PRINT("irq on\n");
         } else {
-            printf("irq off\n");
+            DB_PRINT("irq off\n");
         }
         qemu_set_irq(s->irq, level);
         s->irq_level = level;
@@ -287,7 +287,7 @@ static void stm32f1xx_usart_realize(DeviceState *dev, Error **errp)
     struct stm32f1xx_usart *s = STM32F1XX_USART(dev);
 
     qemu_chr_fe_set_handlers(&s->chr, stm32f1xx_usart_can_receive,
-                             stm32f1xx_usart_receive, NULL, s, NULL, true);
+                             stm32f1xx_usart_receive, NULL, NULL, s, NULL, true);
 }
 
 static void stm32f1xx_usart_class_init(ObjectClass *klass, void *data)
