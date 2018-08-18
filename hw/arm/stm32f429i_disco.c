@@ -28,32 +28,40 @@
 #include "hw/boards.h"
 #include "qemu/error-report.h"
 #include "hw/arm/arm.h"
+#include "exec/address-spaces.h"
 
-struct stm32f10x_duino {
+struct stm32f429i_disco {
     DeviceState *soc;
     struct arm_boot_info boot_info;
 };
 
-static void stm32f10x_duino_init(MachineState *machine) {
-    printf("stm32f10x_duino init\n");
-    struct stm32f10x_duino *s = g_new0(struct stm32f10x_duino, 1);
+static void stm32f429i_disco_init(MachineState *machine) {
+    printf("stm32f429i_disco init\n");
+    struct stm32f429i_disco *s = g_new0(struct stm32f429i_disco, 1);
 
     if (!machine->kernel_filename) {
         fprintf(stderr, "Guest image must be specified (using -kernel)\n");
         exit(1);
     }
 
-    s->soc = qdev_create(NULL, "stm32f10x-soc");
+    s->soc = qdev_create(NULL, "stm32f4xx-soc");
     qdev_prop_set_string(s->soc, "cpu-model", machine->cpu_model);
     object_property_set_bool(OBJECT(s->soc), true, "realized", &error_fatal);
 
+    // Add the sram
+    MemoryRegion *sram = g_new(MemoryRegion, 1);
+    memory_region_init_ram(sram, NULL, "disco.sram", 1024 * 1024 * 8, &error_fatal);
+    vmstate_register_ram_global(sram);
+    memory_region_add_subregion(get_system_memory(), 0x90000000, sram);
+
+    // load kernel
     armv7m_load_kernel(ARM_CPU(first_cpu), machine->kernel_filename, 2 * 1024 * 1024);
 }
 
-static void stm32f10x_duino_machine_init(MachineClass *mc)
+static void stm32f429i_disco_machine_init(MachineClass *mc)
 {
-    mc->desc = "STM32F10X Duino Machine";
-    mc->init = stm32f10x_duino_init;
+    mc->desc = "STM32F429i Discovery Board With RAM";
+    mc->init = stm32f429i_disco_init;
 }
 
-DEFINE_MACHINE("stm32f10x-duino", stm32f10x_duino_machine_init)
+DEFINE_MACHINE("stm32f429i-disco", stm32f429i_disco_machine_init)
