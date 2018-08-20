@@ -31,11 +31,10 @@
 #include <stdio.h>
 
 #include "hw/sysbus.h"
-#include "stm32fxxx.h"
 #include "stm32f10x.h"
 #include "stm32f10x_clktree.h"
 #include "stm32f1xx_rcc.h"
-
+#include "qemu/log.h"
 
 /* DEFINITIONS*/
 
@@ -53,11 +52,11 @@ do { printf("STM32F2XX_RCC: " fmt , ## __VA_ARGS__); } while (0)
 
 #define WARN_UNIMPLEMENTED(new_value, mask, reset_value) \
     if (!IS_RESET_VALUE(new_value, mask, reset_value)) { \
-        stm32_unimp("Not implemented: RCC " #mask ". Masked value: 0x%08x\n", (new_value & mask)); \
+        qemu_log_mask(LOG_UNIMP, "Not implemented: RCC " #mask ". Masked value: 0x%08x\n", (new_value & mask)); \
     }
 
 #define WARN_UNIMPLEMENTED_REG(offset) \
-        stm32_unimp("STM32f1xx_rcc: unimplemented register: 0x%x", (int)offset)
+        qemu_log_mask(LOG_UNIMP, "STM32f1xx_rcc: unimplemented register: 0x%x", (int)offset)
 
 #define HSI_FREQ 16000000
 #define LSI_FREQ 32000
@@ -297,10 +296,119 @@ do { printf("STM32F2XX_RCC: " fmt , ## __VA_ARGS__); } while (0)
 #define SW_HSE_SELECTED 1
 #define SW_PLL_SELECTED 2
 
+#define GET_BIT_MASK(position, value) ((value ? 1 : 0) << position)
+#define GET_BIT_MASK_ONE(position) (1 << position)
+#define GET_BIT_MASK_ZERO(position) (~(1 << position))
+#define GET_BIT_VALUE(value, position) \
+                ((value & GET_BIT_MASK_ONE(position)) >> position)
+#define IS_BIT_SET(value, position) ((value & GET_BIT_MASK_ONE(position)) != 0)
+#define IS_BIT_RESET(value, position) ((value & GET_BIT_MASK_ONE(position)) ==0)
+#define RESET_BIT(var, position) var &= GET_BIT_MASK_ZERO(position)
+
+/* Can be true, false, 0, or 1 */
+#define CHANGE_BIT(var, position, new_value) \
+            var = new_value ? \
+                    (var | GET_BIT_MASK_ONE(position)) : \
+                    (var & GET_BIT_MASK_ZERO(position))
+#define CHANGE_BITS(var, start, mask, new_value) \
+            var = (var & ~mask) | ((new_value << start) & mask)
+
+# define STM32_BAD_REG(offset, size)       \
+        hw_error("%s: Bad register 0x%x - size %u\n", __FUNCTION__, (int)offset, size)
+# define STM32_WARN_RO_REG(offset)        \
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: Read-only register 0x%x\n", \
+                      __FUNCTION__, (int)offset)
+# define STM32_WARN_WO_REG(offset)        \
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: Write-only register 0x%x\n", \
+                      __FUNCTION__, (int)offset)
+# define STM32_NOT_IMPL_REG(offset, size)      \
+        hw_error("%s: Not implemented yet 0x%x - size %u\n", __FUNCTION__, (int)offset, size)
+void stm32_hw_warn(const char *fmt, ...)
+    __attribute__ ((__format__ (__printf__, 1, 2)));
+
+#define stm32_unimp(x...) qemu_log_mask(LOG_UNIMP, x)
+
+
+enum {
+    STM32_PERIPH_UNDEFINED = -1,
+    STM32_RCC_PERIPH = 0,
+    STM32_GPIOA,
+    STM32_GPIOB,
+    STM32_GPIOC,
+    STM32_GPIOD,
+    STM32_GPIOE,
+    STM32_GPIOF,
+    STM32_GPIOG,
+    STM32_GPIOH,
+    STM32_GPIOI,
+    STM32_GPIOJ,
+    STM32_GPIOK,
+    STM32_SYSCFG,
+    STM32_AFIO_PERIPH,
+    STM32_UART1,
+    STM32_UART2,
+    STM32_UART3,
+    STM32_UART4,
+    STM32_UART5,
+    STM32_UART6,
+    STM32_UART7,
+    STM32_UART8,
+    STM32_ADC1,
+    STM32_ADC2,
+    STM32_ADC3,
+    STM32_DAC,
+    STM32_TIM1,
+    STM32_TIM2,
+    STM32_TIM3,
+    STM32_TIM4,
+    STM32_TIM5,
+    STM32_TIM6,
+    STM32_TIM7,
+    STM32_TIM8,
+    STM32_TIM9,
+    STM32_TIM10,
+    STM32_TIM11,
+    STM32_TIM12,
+    STM32_TIM13,
+    STM32_TIM14,
+    STM32_BKP,
+    STM32_PWR,
+    STM32_I2C1,
+    STM32_I2C2,
+    STM32_I2C3,
+    STM32_I2C4,
+    STM32_I2S2,
+    STM32_I2S3,
+    STM32_WWDG,
+    STM32_CAN1,
+    STM32_CAN2,
+    STM32_CAN,
+    STM32_USB,
+    STM32_SPI1,
+    STM32_SPI2,
+    STM32_SPI3,
+    STM32_EXTI_PERIPH,
+    STM32_SDIO,
+    STM32_FSMC,
+    STM32_RTC,
+    STM32_CRC,
+    STM32_DMA1,
+    STM32_DMA2,
+    STM32_DCMI_PERIPH,
+    STM32_CRYP_PERIPH,
+    STM32_HASH_PERIPH,
+    STM32_RNG_PERIPH,
+    STM32_QSPI,
+    STM32_LPTIM1,
+
+    STM32_PERIPH_COUNT,
+};
+
+
 struct stm32f1xx_rcc {
     /* Inherited */
     union {
-        Stm32Rcc inherited;
+        struct Stm32Rcc inherited;
         struct {
             /* Inherited */
             SysBusDevice busdev;
@@ -400,8 +508,8 @@ static void stm32_rcc_periph_enable(
                                     int periph,
                                     uint32_t bit_mask)
 {
-    //printf("rcc set 0x%x %s %d %x: %sable\n", new_value, s->PERIPHCLK[periph]->name, periph, bit_mask, IS_BIT_SET(new_value, bit_mask)?"en":"dis");
-    clktree_set_enabled(s->PERIPHCLK[periph], IS_BIT_SET(new_value, bit_mask));
+    printf("rcc set 0x%x %s %d %x: %sable\n", new_value, s->PERIPHCLK[periph]->name, periph, bit_mask, (new_value & (1 << bit_mask))?"en":"dis");
+    clktree_set_enabled(s->PERIPHCLK[periph], (new_value & (1 << bit_mask)) != 0);
 }
 
 
@@ -415,10 +523,10 @@ static void stm32_rcc_periph_enable(
 static uint32_t stm32_rcc_RCC_CR_read(struct stm32f1xx_rcc *s)
 {
     /* Get the status of the clocks. */
-    const bool PLLON = clktree_is_enabled(s->PLLCLK);
-    const bool HSEON = clktree_is_enabled(s->HSECLK);
-    const bool HSION = clktree_is_enabled(s->HSICLK);
-    const bool PLLI2SON = clktree_is_enabled(s->PLLI2SCLK);
+    const bool PLLON = true; //clktree_is_enabled(s->PLLCLK);
+    const bool HSEON = true; //clktree_is_enabled(s->HSECLK);
+    const bool HSION = true; //clktree_is_enabled(s->HSICLK);
+    const bool PLLI2SON = true; //clktree_is_enabled(s->PLLI2SCLK);
 
     /* build the register value based on the clock states.  If a clock is on,
      * then its ready bit is always set.
@@ -508,7 +616,7 @@ static void stm32_rcc_RCC_PLLCFGR_write(struct stm32f1xx_rcc *s, uint32_t new_va
     if (init == false) {
         const bool are_disabled = (!clktree_is_enabled(s->PLLCLK) /* && TODO: !clktree_is_enabled(s->PLLI2SCLK) */);
         if (are_disabled == false) {
-            const char *warning_fmt = "Can only change %s while PLL and PLLI2S are disabled";
+            const char *warning_fmt = "Can only change %s while PLL and PLLI2S are disabled\n";
             if (new_PLLM != s->RCC_PLLCFGR_PLLM) {
                 printf(warning_fmt, "PLLM");
             }
@@ -883,20 +991,6 @@ static uint64_t stm32_rcc_readw(void *opaque, hwaddr offset)
     return 0;
 }
 
-static void stm32_rcc_writeb(void *opaque, hwaddr offset, uint64_t value)
-{
-    struct stm32f1xx_rcc *s = (struct stm32f1xx_rcc *)opaque;
-
-    switch (offset) {
-    case RCC_BDCR_OFFSET:
-        stm32_rcc_RCC_BDCR_writeb0(s, value, false);
-        break;
-    default:
-        STM32_BAD_REG(offset, 1);
-        break;
-    }
-}
-
 static void stm32_rcc_writew(void *opaque, hwaddr offset,
                              uint64_t value)
 {
@@ -916,10 +1010,10 @@ static void stm32_rcc_writew(void *opaque, hwaddr offset,
             stm32_rcc_RCC_CIR_write(s, value, false);
             break;
         case RCC_APB1RSTR_OFFSET:
-            stm32_unimp("Unimplemented write: RCC_APB1RSTR_OFFSET 0x%x\n", (uint32_t)value);
+            qemu_log_mask(LOG_UNIMP, "Unimplemented write: RCC_APB1RSTR_OFFSET 0x%x\n", (uint32_t)value);
             break;
         case RCC_APB2RSTR_OFFSET:
-            stm32_unimp("Unimplemented write: RCC_APB2RSTR_OFFSET 0x%x\n", (uint32_t)value);
+            qemu_log_mask(LOG_UNIMP, "Unimplemented write: RCC_APB2RSTR_OFFSET 0x%x\n", (uint32_t)value);
             break;
         case RCC_AHB3RSTR_OFFSET:
             WARN_UNIMPLEMENTED_REG(offset);
@@ -989,9 +1083,14 @@ static void stm32_rcc_write(void *opaque, hwaddr offset,
         case 4:
             stm32_rcc_writew(opaque, offset, value);
             break;
-        case 1:
-            stm32_rcc_writeb(opaque, offset, value);
-            break;
+        case 1: {
+            hwaddr woffset = offset & ~0x3;
+            uint32_t boffset = offset & 0x3;
+            uint32_t val = stm32_rcc_readw(opaque, woffset);
+            val &= ~(0xff << boffset);
+            val |= (value << boffset);
+            stm32_rcc_writew(opaque, woffset, value);
+        } break;
         default:
             WARN_UNIMPLEMENTED_REG(offset);
             break;
@@ -1025,7 +1124,8 @@ static void stm32_rcc_hclk_upd_irq_handler(void *opaque, int n, int level)
     struct stm32f1xx_rcc *s = (struct stm32f1xx_rcc *)opaque;
 
     uint32_t hclk_freq = 0;
-    
+    uint32_t system_clock_scale = 0; 
+
     hclk_freq = clktree_get_output_freq(s->HCLK);
 
     /* Only update the scales if the frequency is not zero. */

@@ -36,7 +36,6 @@ struct stm32f10x_duino {
 };
 
 static void stm32f10x_duino_init(MachineState *machine) {
-    printf("stm32f10x_duino init\n");
     struct stm32f10x_duino *s = g_new0(struct stm32f10x_duino, 1);
 
     if (!machine->kernel_filename) {
