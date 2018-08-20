@@ -35,7 +35,7 @@
 #define FLASH_BASE_ADDRESS 0x08000000
 #define FLASH_SIZE (2 * 1024 * 1024)
 #define SRAM_BASE_ADDRESS 0x20000000
-#define SRAM_SIZE (176 * 1024)
+#define SRAM_SIZE (192 * 1024)
 
 #include "hw/misc/stm32f2xx_syscfg.h"
 #include "hw/timer/stm32f2xx_timer.h"
@@ -44,6 +44,7 @@
 #include "hw/or-irq.h"
 #include "hw/arm/arm.h"
 #include "hw/arm/armv7m.h"
+#include "hw/arm/stm32fxxx.h"
 
 #define STM32F429_439xx
 #include "stm32f4xx.h"
@@ -52,7 +53,7 @@
 #define STM32F4XX_SOC(obj) \
     OBJECT_CHECK(struct stm32f4xx_soc, (obj), TYPE_STM32F4XX_SOC)
 
-#define STM32F4XX_NUM_UARTS 6
+#define STM32F4XX_NUM_UARTS 8
 #define STM32F4XX_NUM_TIMERS 4
 #define STM32F4XX_NUM_ADCS 3
 #define STM32F4XX_NUM_SPIS 3
@@ -73,11 +74,15 @@ struct stm32f4xx_soc {
     SysBusDevice *adc[STM32F4XX_NUM_ADCS];
     SysBusDevice *spi[STM32F4XX_NUM_SPIS];
     SysBusDevice *rcc;
+    SysBusDevice *fmc;
+    SysBusDevice *pwr;
 
     qemu_or_irq *adc_irqs;
 
     char *cpu_type;
     MemoryRegion mmio;
+
+    struct stm32fxxx_state state;
 };
 
 static void stm32f4xx_rogue_mem_write(void *opaque, hwaddr addr,
@@ -134,6 +139,10 @@ static void stm32f4xx_soc_initfn(Object *obj){
     qdev_init_nofail(rcc);
     object_property_add_child(obj, "rcc", OBJECT(rcc), NULL);
     s->rcc = SYS_BUS_DEVICE(rcc);
+
+    s->fmc = sysbus_create_child_obj(obj, name, "stm32fxxx-fmc");
+    s->pwr = sysbus_create_child_obj(obj, name, "stm32fxxx-pwr");
+    qdev_prop_set_ptr(DEVICE(s->pwr), "state", &s->state);
 
     for (i = 0; i < STM32F4XX_NUM_UARTS; i++) {
         snprintf(name, NAME_SIZE, "usart[%d]", i);
@@ -199,6 +208,13 @@ static void stm32f4xx_soc_realize(DeviceState *dev_soc, Error **errp) {
     }
 
     // map peripherals into memory of the cpu
+    // TODO: DAC
+    // TODO: BXCAN1 & 2
+    // TODO: USBFS
+    // TODO: I2C1 & 2
+    // TODO: RTC
+    // TODO: TIM
+
     if(stm32_realize_peripheral(&s->armv7m, s->rcc, 0x40023800, 5, errp) < 0) return;
     if(stm32_realize_peripheral(&s->armv7m, s->syscfg, 0x40013800, 91, errp) < 0) return;
 
@@ -206,21 +222,23 @@ static void stm32f4xx_soc_realize(DeviceState *dev_soc, Error **errp) {
         qdev_prop_set_chr(DEVICE(s->usart[i]), "chardev", serial_hd(i));
     }
 
-    if(stm32_realize_peripheral(&s->armv7m, s->usart[0], 0x40011000, 37, errp) < 0) return;
-    if(stm32_realize_peripheral(&s->armv7m, s->usart[1], 0x40004400, 38, errp) < 0) return;
-    if(stm32_realize_peripheral(&s->armv7m, s->usart[2], 0x40004800, 39, errp) < 0) return;
-    if(stm32_realize_peripheral(&s->armv7m, s->usart[3], 0x40004C00, 52, errp) < 0) return;
-    if(stm32_realize_peripheral(&s->armv7m, s->usart[4], 0x40005000, 53, errp) < 0) return;
-    if(stm32_realize_peripheral(&s->armv7m, s->usart[5], 0x40011400, 71, errp) < 0) return;
+    if(stm32_realize_peripheral(&s->armv7m, s->usart[0], 0x40011000, 37, errp) < 0) return; // USART1
+    if(stm32_realize_peripheral(&s->armv7m, s->usart[1], 0x40004400, 38, errp) < 0) return; // USART2
+    if(stm32_realize_peripheral(&s->armv7m, s->usart[2], 0x40004800, 39, errp) < 0) return; // USART3
+    if(stm32_realize_peripheral(&s->armv7m, s->usart[3], 0x40004C00, 52, errp) < 0) return; // UART4
+    if(stm32_realize_peripheral(&s->armv7m, s->usart[4], 0x40005000, 53, errp) < 0) return; // UART5
+    if(stm32_realize_peripheral(&s->armv7m, s->usart[5], 0x40011400, 71, errp) < 0) return; // USART6
+    if(stm32_realize_peripheral(&s->armv7m, s->usart[6], 0x40007800, 82, errp) < 0) return; // UART7
+    if(stm32_realize_peripheral(&s->armv7m, s->usart[7], 0x40007C00, 83, errp) < 0) return; // UART8
 
     for(i = 0; i < STM32F4XX_NUM_TIMERS; i++){
         qdev_prop_set_uint64(DEVICE(s->tim[i]), "clock-frequency", 100000000);
     }
 
-    if(stm32_realize_peripheral(&s->armv7m, s->tim[0], 0x40000000, 28, errp) < 0) return;
-    if(stm32_realize_peripheral(&s->armv7m, s->tim[1], 0x40000400, 29, errp) < 0) return;
-    if(stm32_realize_peripheral(&s->armv7m, s->tim[2], 0x40000800, 30, errp) < 0) return;
-    if(stm32_realize_peripheral(&s->armv7m, s->tim[3], 0x40000C00, 50, errp) < 0) return;
+    if(stm32_realize_peripheral(&s->armv7m, s->tim[0], 0x40000000, 28, errp) < 0) return; // TIM2
+    if(stm32_realize_peripheral(&s->armv7m, s->tim[1], 0x40000400, 29, errp) < 0) return; // TIM3
+    if(stm32_realize_peripheral(&s->armv7m, s->tim[2], 0x40000800, 30, errp) < 0) return; // TIM4
+    if(stm32_realize_peripheral(&s->armv7m, s->tim[3], 0x40000C00, 50, errp) < 0) return; // TIM5
 
     /* ADC 1 to 3 */
     object_property_set_int(OBJECT(s->adc_irqs), STM32F4XX_NUM_ADCS,
@@ -233,13 +251,16 @@ static void stm32f4xx_soc_realize(DeviceState *dev_soc, Error **errp) {
     }
     qdev_connect_gpio_out(DEVICE(s->adc_irqs), 0, qdev_get_gpio_in(armv7m, 18));
 
-    if(stm32_realize_peripheral(&s->armv7m, s->adc[0], 0x40012400, 18, errp) < 0) return;
-    if(stm32_realize_peripheral(&s->armv7m, s->adc[1], 0x40012800, 18, errp) < 0) return;
-    if(stm32_realize_peripheral(&s->armv7m, s->adc[2], 0x40013C00, 18, errp) < 0) return;
+    if(stm32_realize_peripheral(&s->armv7m, s->adc[0], 0x40012000, 18, errp) < 0) return; // ADC1 & 2 & 3
 
     if(stm32_realize_peripheral(&s->armv7m, s->spi[0], 0x40013000, 18, errp) < 0) return;
     if(stm32_realize_peripheral(&s->armv7m, s->spi[1], 0x40003800, 18, errp) < 0) return;
     if(stm32_realize_peripheral(&s->armv7m, s->spi[2], 0x40003C00, 18, errp) < 0) return;
+    if(stm32_realize_peripheral(&s->armv7m, s->spi[2], 0x40013400, 18, errp) < 0) return;
+
+    if(stm32_realize_peripheral(&s->armv7m, s->fmc, 0xa0000000, 48, errp) < 0) return;
+
+    if(stm32_realize_peripheral(&s->armv7m, s->pwr, 0x40007000, 0, errp) < 0) return;
 }
 
 static Property stm32f4xx_soc_properties[] = {
