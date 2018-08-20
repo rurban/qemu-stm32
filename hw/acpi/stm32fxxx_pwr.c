@@ -271,13 +271,14 @@ static void stm32fxxx_pwr_init(Object *obj){
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &self->mmio);
 }
 
-static void stm32fxxx_pwr_realize(DeviceState *dev, Error **errp){
-    //struct stm32fxxx_pwr *self = STM32FXXX_PWR(dev);
-
+static void stm32fxxx_pwr_reset(DeviceState *dev){
+    struct stm32fxxx_pwr *self = OBJECT_CHECK(struct stm32fxxx_pwr, dev, TYPE_STM32FXXX_PWR);
+    self->state->PWR_CR = 0x0000C000;
+    self->state->PWR_CSR = 0;
 }
 
-static void stm32fxxx_pwr_reset(DeviceState *dev){
-
+static void stm32fxxx_pwr_realize(DeviceState *dev, Error **errp){
+    stm32fxxx_pwr_reset(dev);
 }
 
 static Property stm32fxxx_pwr_properties[] = {

@@ -49,14 +49,9 @@
 #define STM32F429_439xx
 #include "stm32f4xx.h"
 
-#define TYPE_STM32F4XX_SOC "stm32f4xx-soc"
-#define STM32F4XX_SOC(obj) \
-    OBJECT_CHECK(struct stm32f4xx_soc, (obj), TYPE_STM32F4XX_SOC)
-
-#define STM32F4XX_NUM_UARTS 8
-#define STM32F4XX_NUM_TIMERS 4
-#define STM32F4XX_NUM_ADCS 3
-#define STM32F4XX_NUM_SPIS 3
+#define TYPE_STM32FXXX_SOC "stm32f4xx-soc"
+#define STM32FXXX_SOC(obj) \
+    OBJECT_CHECK(struct stm32f4xx_soc, (obj), TYPE_STM32FXXX_SOC)
 
 #define NAME_SIZE 20
 
@@ -69,13 +64,14 @@ struct stm32f4xx_soc {
 
     SysBusDevice *syscfg;
 
-    SysBusDevice *usart[STM32F4XX_NUM_UARTS];
-    SysBusDevice *tim[STM32F4XX_NUM_TIMERS];
-    SysBusDevice *adc[STM32F4XX_NUM_ADCS];
-    SysBusDevice *spi[STM32F4XX_NUM_SPIS];
+    SysBusDevice *usart[STM32FXXX_NUM_UARTS];
+    SysBusDevice *tim[STM32FXXX_NUM_TIMERS];
+    SysBusDevice *adc[STM32FXXX_NUM_ADCS];
+    SysBusDevice *spi[STM32FXXX_NUM_SPIS];
     SysBusDevice *rcc;
     SysBusDevice *fmc;
     SysBusDevice *pwr;
+    SysBusDevice *gpio[STM32FXXX_NUM_GPIOS];
 
     qemu_or_irq *adc_irqs;
 
@@ -119,7 +115,7 @@ static int stm32_realize_peripheral(ARMv7MState *cpu, SysBusDevice *dev, hwaddr 
 }
 
 static void stm32f4xx_soc_initfn(Object *obj){
-    struct stm32f4xx_soc *s = STM32F4XX_SOC(obj);
+    struct stm32f4xx_soc *s = STM32FXXX_SOC(obj);
     int i;
     char name[NAME_SIZE];
 
@@ -144,31 +140,38 @@ static void stm32f4xx_soc_initfn(Object *obj){
     s->pwr = sysbus_create_child_obj(obj, name, "stm32fxxx-pwr");
     qdev_prop_set_ptr(DEVICE(s->pwr), "state", &s->state);
 
-    for (i = 0; i < STM32F4XX_NUM_UARTS; i++) {
+    for (i = 0; i < STM32FXXX_NUM_UARTS; i++) {
         snprintf(name, NAME_SIZE, "usart[%d]", i);
         s->usart[i] = sysbus_create_child_obj(obj, name, "stm32f1xx-usart");
     }
 
-    for (i = 0; i < STM32F4XX_NUM_TIMERS; i++) {
+    for (i = 0; i < STM32FXXX_NUM_TIMERS; i++) {
         snprintf(name, NAME_SIZE, "tim[%d]", i);
         s->tim[i] = sysbus_create_child_obj(obj, name, "stm32f2xx-timer");
     }
 
     s->adc_irqs = OR_IRQ(object_new(TYPE_OR_IRQ));
 
-    for (i = 0; i < STM32F4XX_NUM_ADCS; i++) {
+    for (i = 0; i < STM32FXXX_NUM_ADCS; i++) {
         snprintf(name, NAME_SIZE, "adc[%d]", i);
         s->adc[i] = sysbus_create_child_obj(obj, name, "stm32f2xx-adc");
     }
 
-    for (i = 0; i < STM32F4XX_NUM_SPIS; i++) {
+    for (i = 0; i < STM32FXXX_NUM_SPIS; i++) {
         snprintf(name, NAME_SIZE, "spi[%d]", i);
         s->spi[i] = sysbus_create_child_obj(obj, name, "stm32f2xx-spi");
+    }
+
+    for (i = 0; i < STM32FXXX_NUM_GPIOS; i++) {
+        snprintf(name, NAME_SIZE, "GPIO%c", 'A' + i);
+        s->gpio[i] = sysbus_create_child_obj(obj, name, "stm32fxxx-gpio");
+        qdev_prop_set_uint8(DEVICE(s->gpio[i]), "port_id", i);
+        qdev_prop_set_ptr(DEVICE(s->gpio[i]), "state", &s->state);
     }
 }
 
 static void stm32f4xx_soc_realize(DeviceState *dev_soc, Error **errp) {
-    struct stm32f4xx_soc *s = STM32F4XX_SOC(dev_soc);
+    struct stm32f4xx_soc *s = STM32FXXX_SOC(dev_soc);
     Error *err = NULL;
     int i;
 
@@ -218,7 +221,7 @@ static void stm32f4xx_soc_realize(DeviceState *dev_soc, Error **errp) {
     if(stm32_realize_peripheral(&s->armv7m, s->rcc, 0x40023800, 5, errp) < 0) return;
     if(stm32_realize_peripheral(&s->armv7m, s->syscfg, 0x40013800, 91, errp) < 0) return;
 
-    for (i = 0; i < STM32F4XX_NUM_UARTS; i++) {
+    for (i = 0; i < STM32FXXX_NUM_UARTS; i++) {
         qdev_prop_set_chr(DEVICE(s->usart[i]), "chardev", serial_hd(i));
     }
 
@@ -231,7 +234,7 @@ static void stm32f4xx_soc_realize(DeviceState *dev_soc, Error **errp) {
     if(stm32_realize_peripheral(&s->armv7m, s->usart[6], 0x40007800, 82, errp) < 0) return; // UART7
     if(stm32_realize_peripheral(&s->armv7m, s->usart[7], 0x40007C00, 83, errp) < 0) return; // UART8
 
-    for(i = 0; i < STM32F4XX_NUM_TIMERS; i++){
+    for(i = 0; i < STM32FXXX_NUM_TIMERS; i++){
         qdev_prop_set_uint64(DEVICE(s->tim[i]), "clock-frequency", 100000000);
     }
 
@@ -241,7 +244,7 @@ static void stm32f4xx_soc_realize(DeviceState *dev_soc, Error **errp) {
     if(stm32_realize_peripheral(&s->armv7m, s->tim[3], 0x40000C00, 50, errp) < 0) return; // TIM5
 
     /* ADC 1 to 3 */
-    object_property_set_int(OBJECT(s->adc_irqs), STM32F4XX_NUM_ADCS,
+    object_property_set_int(OBJECT(s->adc_irqs), STM32FXXX_NUM_ADCS,
                             "num-lines", &err);
 
     object_property_set_bool(OBJECT(s->adc_irqs), true, "realized", &err);
@@ -261,6 +264,18 @@ static void stm32f4xx_soc_realize(DeviceState *dev_soc, Error **errp) {
     if(stm32_realize_peripheral(&s->armv7m, s->fmc, 0xa0000000, 48, errp) < 0) return;
 
     if(stm32_realize_peripheral(&s->armv7m, s->pwr, 0x40007000, 0, errp) < 0) return;
+
+    if(stm32_realize_peripheral(&s->armv7m, s->gpio[0], 0x40020000, 0, errp) < 0) return;
+    if(stm32_realize_peripheral(&s->armv7m, s->gpio[1], 0x40020400, 0, errp) < 0) return;
+    if(stm32_realize_peripheral(&s->armv7m, s->gpio[2], 0x40020800, 0, errp) < 0) return;
+    if(stm32_realize_peripheral(&s->armv7m, s->gpio[3], 0x40020C00, 0, errp) < 0) return;
+    if(stm32_realize_peripheral(&s->armv7m, s->gpio[4], 0x40021000, 0, errp) < 0) return;
+    if(stm32_realize_peripheral(&s->armv7m, s->gpio[5], 0x40021400, 0, errp) < 0) return;
+    if(stm32_realize_peripheral(&s->armv7m, s->gpio[6], 0x40021800, 0, errp) < 0) return;
+    if(stm32_realize_peripheral(&s->armv7m, s->gpio[7], 0x40021C00, 0, errp) < 0) return;
+    if(stm32_realize_peripheral(&s->armv7m, s->gpio[8], 0x40022000, 0, errp) < 0) return;
+    if(stm32_realize_peripheral(&s->armv7m, s->gpio[9], 0x40022400, 0, errp) < 0) return;
+    if(stm32_realize_peripheral(&s->armv7m, s->gpio[10], 0x40022800, 0, errp) < 0) return;
 }
 
 static Property stm32f4xx_soc_properties[] = {
@@ -277,7 +292,7 @@ static void stm32f4xx_soc_class_init(ObjectClass *klass, void *data)
 }
 
 static const TypeInfo stm32f4xx_soc_info = {
-    .name          = TYPE_STM32F4XX_SOC,
+    .name          = TYPE_STM32FXXX_SOC,
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(struct stm32f4xx_soc),
     .instance_init = stm32f4xx_soc_initfn,
