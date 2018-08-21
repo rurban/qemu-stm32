@@ -43,7 +43,7 @@ static void stm32f10x_duino_init(MachineState *machine) {
         exit(1);
     }
 
-    s->soc = qdev_create(NULL, "stm32f10x-soc");
+    s->soc = qdev_create(NULL, "stm32fxxx-soc");
     qdev_prop_set_string(s->soc, "cpu-type", ARM_CPU_TYPE_NAME("cortex-m3"));
     object_property_set_bool(OBJECT(s->soc), true, "realized", &error_fatal);
 

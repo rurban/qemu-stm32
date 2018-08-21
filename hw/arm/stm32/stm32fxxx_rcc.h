@@ -1,5 +1,5 @@
 #include "hw/sysbus.h"
-#include "hw/arm/stm32f10x_clktree.h"
+#include "stm32fxxx_clktree.h"
 
 /** RCC Base data structure */
 struct Stm32Rcc {

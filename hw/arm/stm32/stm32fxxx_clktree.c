@@ -26,7 +26,7 @@
 #include "cpu.h"
 
 #include "hw/hw.h"
-#include "stm32f10x_clktree.h"
+#include "stm32fxxx_clktree.h"
 
 
 /* DEFINITIONS*/

@@ -46,8 +46,8 @@
 #include "hw/arm/armv7m.h"
 #include "hw/arm/stm32fxxx.h"
 
-#define STM32F429_439xx
-#include "stm32f4xx.h"
+//#define STM32F429_439xx
+//#include "stm32f4xx.h"
 
 #define TYPE_STM32FXXX_SOC "stm32f4xx-soc"
 #define STM32FXXX_SOC(obj) \

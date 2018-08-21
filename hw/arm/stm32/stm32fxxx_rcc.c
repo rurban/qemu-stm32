@@ -30,9 +30,8 @@
 #include <stdio.h>
 
 #include "hw/sysbus.h"
-#include "stm32f10x.h"
-#include "stm32f10x_clktree.h"
-#include "stm32f1xx_rcc.h"
+#include "stm32fxxx_clktree.h"
+#include "stm32fxxx_rcc.h"
 #include "qemu/log.h"
 #include "hw/arm/arm.h"
 
