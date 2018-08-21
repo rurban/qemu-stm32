@@ -38,6 +38,15 @@ static void systick_set_period_from_clock(SysTickState *s)
      */
     if (s->control & SYSTICK_CLKSOURCE) {
         ptimer_set_period_from_clock(s->ptimer, s->cpuclk, 1);
+        if(system_clock_scale == 0){
+            static bool warned = false;
+            if(!warned) {
+                fprintf(stderr, "armv7m systick: WARNING: system_clock_scale is zero - returning 1\n");
+                warned = true;
+            }
+            return 1;
+        }
+        return system_clock_scale;
     } else {
         ptimer_set_period_from_clock(s->ptimer, s->refclk, 1);
     }
