@@ -24,7 +24,7 @@
 #define STM32FXXX_NUM_UARTS 8
 #define STM32FXXX_NUM_TIMERS 4
 #define STM32FXXX_NUM_ADCS 3
-#define STM32FXXX_NUM_SPIS 3
+#define STM32FXXX_NUM_SPIS 6
 #define STM32FXXX_NUM_GPIOS 11
 
 struct stm32fxxx_state {
@@ -45,6 +45,22 @@ struct stm32fxxx_state {
             };
         };
     } GPIO[STM32FXXX_NUM_GPIOS];
+    struct stm32fxxx_spi_regs {
+        union {
+            uint16_t regs[9];
+            struct {
+                uint16_t CR1;
+                uint16_t CR2;
+                uint16_t SR;
+                uint16_t DR;
+                uint16_t CRCPR;
+                uint16_t RXCRCR;
+                uint16_t TXCRCR;
+                uint16_t I2SCFGR;
+                uint16_t I2SPR;
+            };
+        };
+    } SPI[STM32FXXX_NUM_SPIS];
     uint32_t PWR_CR;
     uint32_t PWR_CSR;
 };

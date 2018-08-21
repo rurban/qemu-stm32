@@ -71,6 +71,7 @@ struct stm32f4xx_soc {
     SysBusDevice *rcc;
     SysBusDevice *fmc;
     SysBusDevice *pwr;
+    SysBusDevice *dwt;
     SysBusDevice *gpio[STM32FXXX_NUM_GPIOS];
 
     qemu_or_irq *adc_irqs;
@@ -136,13 +137,16 @@ static void stm32f4xx_soc_initfn(Object *obj){
     object_property_add_child(obj, "rcc", OBJECT(rcc), NULL);
     s->rcc = SYS_BUS_DEVICE(rcc);
 
-    s->fmc = sysbus_create_child_obj(obj, name, "stm32fxxx-fmc");
-    s->pwr = sysbus_create_child_obj(obj, name, "stm32fxxx-pwr");
+    s->fmc = sysbus_create_child_obj(obj, "fmc", "stm32fxxx-fmc");
+    s->pwr = sysbus_create_child_obj(obj, "pwr", "stm32fxxx-pwr");
+    s->dwt = sysbus_create_child_obj(obj, "dwt", "armv7m-dwt");
+
     qdev_prop_set_ptr(DEVICE(s->pwr), "state", &s->state);
 
     for (i = 0; i < STM32FXXX_NUM_UARTS; i++) {
         snprintf(name, NAME_SIZE, "usart[%d]", i);
         s->usart[i] = sysbus_create_child_obj(obj, name, "stm32f1xx-usart");
+        qdev_prop_set_chr(DEVICE(s->usart[i]), "chardev", serial_hd(i));
     }
 
     for (i = 0; i < STM32FXXX_NUM_TIMERS; i++) {
@@ -159,7 +163,9 @@ static void stm32f4xx_soc_initfn(Object *obj){
 
     for (i = 0; i < STM32FXXX_NUM_SPIS; i++) {
         snprintf(name, NAME_SIZE, "spi[%d]", i);
-        s->spi[i] = sysbus_create_child_obj(obj, name, "stm32f2xx-spi");
+        s->spi[i] = sysbus_create_child_obj(obj, name, "stm32fxxx-spi");
+        qdev_prop_set_ptr(DEVICE(s->spi[i]), "regs", &s->state.SPI[i]);
+        qdev_prop_set_uint8(DEVICE(s->spi[i]), "device_id", i);
     }
 
     for (i = 0; i < STM32FXXX_NUM_GPIOS; i++) {
@@ -201,6 +207,7 @@ static void stm32f4xx_soc_realize(DeviceState *dev_soc, Error **errp) {
 	// init the cpu on the soc
 	qdev_prop_set_uint32(armv7m, "num-irq", 96);
     qdev_prop_set_string(armv7m, "cpu-type", s->cpu_type);
+    qdev_prop_set_bit(armv7m, "enable-bitband", true);
     object_property_set_link(OBJECT(&s->armv7m), OBJECT(get_system_memory()),
                                      "memory", &error_abort);
 
@@ -220,10 +227,6 @@ static void stm32f4xx_soc_realize(DeviceState *dev_soc, Error **errp) {
 
     if(stm32_realize_peripheral(&s->armv7m, s->rcc, 0x40023800, 5, errp) < 0) return;
     if(stm32_realize_peripheral(&s->armv7m, s->syscfg, 0x40013800, 91, errp) < 0) return;
-
-    for (i = 0; i < STM32FXXX_NUM_UARTS; i++) {
-        qdev_prop_set_chr(DEVICE(s->usart[i]), "chardev", serial_hd(i));
-    }
 
     if(stm32_realize_peripheral(&s->armv7m, s->usart[0], 0x40011000, 37, errp) < 0) return; // USART1
     if(stm32_realize_peripheral(&s->armv7m, s->usart[1], 0x40004400, 38, errp) < 0) return; // USART2
@@ -256,14 +259,17 @@ static void stm32f4xx_soc_realize(DeviceState *dev_soc, Error **errp) {
 
     if(stm32_realize_peripheral(&s->armv7m, s->adc[0], 0x40012000, 18, errp) < 0) return; // ADC1 & 2 & 3
 
-    if(stm32_realize_peripheral(&s->armv7m, s->spi[0], 0x40013000, 18, errp) < 0) return;
-    if(stm32_realize_peripheral(&s->armv7m, s->spi[1], 0x40003800, 18, errp) < 0) return;
-    if(stm32_realize_peripheral(&s->armv7m, s->spi[2], 0x40003C00, 18, errp) < 0) return;
-    if(stm32_realize_peripheral(&s->armv7m, s->spi[2], 0x40013400, 18, errp) < 0) return;
+    if(stm32_realize_peripheral(&s->armv7m, s->spi[0], 0x40013000, 35, errp) < 0) return;
+    if(stm32_realize_peripheral(&s->armv7m, s->spi[1], 0x40003800, 36, errp) < 0) return;
+    if(stm32_realize_peripheral(&s->armv7m, s->spi[2], 0x40003C00, 51, errp) < 0) return;
+    if(stm32_realize_peripheral(&s->armv7m, s->spi[3], 0x40013400, 84, errp) < 0) return;
+    if(stm32_realize_peripheral(&s->armv7m, s->spi[4], 0x40015000, 85, errp) < 0) return;
+    if(stm32_realize_peripheral(&s->armv7m, s->spi[5], 0x40015400, 86, errp) < 0) return;
 
     if(stm32_realize_peripheral(&s->armv7m, s->fmc, 0xa0000000, 48, errp) < 0) return;
 
     if(stm32_realize_peripheral(&s->armv7m, s->pwr, 0x40007000, 0, errp) < 0) return;
+    if(stm32_realize_peripheral(&s->armv7m, s->dwt, 0xe0001000, 0, errp) < 0) return;
 
     if(stm32_realize_peripheral(&s->armv7m, s->gpio[0], 0x40020000, 0, errp) < 0) return;
     if(stm32_realize_peripheral(&s->armv7m, s->gpio[1], 0x40020400, 0, errp) < 0) return;

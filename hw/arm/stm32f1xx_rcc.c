@@ -26,7 +26,6 @@
 #include "qemu-common.h"
 #include "cpu.h"
 
-
 #include "qemu/timer.h"
 #include <stdio.h>
 
@@ -35,6 +34,7 @@
 #include "stm32f10x_clktree.h"
 #include "stm32f1xx_rcc.h"
 #include "qemu/log.h"
+#include "hw/arm/arm.h"
 
 /* DEFINITIONS*/
 
@@ -1124,7 +1124,6 @@ static void stm32_rcc_hclk_upd_irq_handler(void *opaque, int n, int level)
     struct stm32f1xx_rcc *s = (struct stm32f1xx_rcc *)opaque;
 
     uint32_t hclk_freq = 0;
-    uint32_t system_clock_scale = 0; 
 
     hclk_freq = clktree_get_output_freq(s->HCLK);
 

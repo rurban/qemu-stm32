@@ -26,8 +26,8 @@
 
 #define TYPE_STM32FXXX_GPIO "stm32fxxx-gpio"
 
-#define GPIO_TRACE(fmt, ...) printf("stm32fxxx_gpio: " fmt, ##__VA_ARGS__)
-#define GPIO_ERROR(fmt, ...) printf("stm32fxxx_gpio: ERROR: " fmt, ##__VA_ARGS__)
+#define GPIO_TRACE(fmt, ...) qemu_log_mask(LOG_TRACE, "stm32fxxx_gpio: " fmt, ##__VA_ARGS__)
+#define GPIO_ERROR(fmt, ...) qemu_log_mask(LOG_TRACE, "stm32fxxx_gpio: ERROR: " fmt, ##__VA_ARGS__)
 
 struct stm32fxxx_gpio {
     SysBusDevice parent;
@@ -69,13 +69,13 @@ static void stm32fxxx_gpio_write(void *opaque, hwaddr addr, uint64_t val64, unsi
     uint32_t val = (uint32_t)val64;
 
     if(size == 1){
-        int byte = addr & 3;
-        val = (self->regs->regs[addr] & ~(0xff << byte)) | (val & (0xff << byte));
+        int bitshift = (addr & 3) * 8;
         addr &= ~3;
+        val = (self->regs->regs[addr] & ~(0xff << bitshift)) | ((val & 0xff) << bitshift);
     } else if(size == 2) {
-        int word = addr & 3;
-        val = (self->regs->regs[addr] & ~(0xffff << word)) | (val & (0xffff << word));
+        int bitshift = (addr & 3) * 8;
         addr &= ~3;
+        val = (self->regs->regs[addr] & ~(0xffff << bitshift)) | ((val & 0xffff) << bitshift);
     } else if(size == 4) {
         // skip
     } else {
@@ -157,14 +157,15 @@ static void stm32fxxx_gpio_write(void *opaque, hwaddr addr, uint64_t val64, unsi
                     GPIO_ERROR("GPIO%c P%c%d: BS and BR both set\n", 'A' + self->port_id, 'A' + self->port_id, c);
                 } else if(set){
                     self->regs->ODR |= (1 << c);
-                    GPIO_TRACE("GPIO%c P%c%d: write value 1\n", 'A' + self->port_id, 'A' + self->port_id, c);
+                    //GPIO_TRACE("GPIO%c P%c%d: write value 1\n", 'A' + self->port_id, 'A' + self->port_id, c);
                 } else if(reset) {
                     self->regs->ODR &= ~(1 << c);
-                    GPIO_TRACE("GPIO%c P%c%d: write value 0\n", 'A' + self->port_id, 'A' + self->port_id, c);
+                    //GPIO_TRACE("GPIO%c P%c%d: write value 0\n", 'A' + self->port_id, 'A' + self->port_id, c);
                 } else {
                     //GPIO_ERROR("GPIO%c P%c%d: BSRR: no action taken\n", 'A' + self->port_id, 'A' + self->port_id, c);
                 }
             }
+            self->regs->BSRR = 0;
         } break;
         case 0x1c: {
             GPIO_ERROR("Lock register not implemented\n");
