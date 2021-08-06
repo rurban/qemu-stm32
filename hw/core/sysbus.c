@@ -347,18 +347,25 @@ BusState *sysbus_get_default(void)
     return main_system_bus;
 }
 
+#if 0
 void sysbus_init_child_obj(Object *parent, const char *childname, void *child,
                            size_t childsize, const char *childtype)
 {
-    object_initialize_child(parent, childname, child, childsize, childtype,
-                            &error_abort, NULL);
-    qdev_set_parent_bus(DEVICE(child), sysbus_get_default());
+    /* Example:
+    object_initialize_child(OBJECT(s), "xram-irq-orgate",
+                            &s->lpd.xram.irq_orgate, TYPE_OR_IRQ);
+    */
+    object_initialize_child(parent, childname, child, childtype);
+    qdev_set_parent_bus(DEVICE(child), sysbus_get_default(), &error_abort);
 }
+#endif
 
-SysBusDevice *sysbus_create_child_obj(Object *parent, const char *childname, const char *childtype) {
+SysBusDevice *sysbus_create_child_obj(Object *parent, const char *childname,
+                                      const char *childtype)
+{
     SysBusDevice *dev = SYS_BUS_DEVICE(object_new(childtype));
-    object_property_add_child(parent, childname, OBJECT(dev), NULL);
-    qdev_set_parent_bus(DEVICE(dev), sysbus_get_default());
+    object_property_add_child(parent, childname, OBJECT(dev));
+    qdev_set_parent_bus(DEVICE(dev), sysbus_get_default(), &error_abort);
     return dev;
 }
 
