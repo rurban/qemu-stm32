@@ -59,6 +59,7 @@ struct AtmegaMcuClass {
     size_t io_size;
     size_t gpio_count;
     size_t adc_count;
+    size_t usart_count;
     const uint8_t *irq;
     const peripheral_cfg *dev;
 };
@@ -225,6 +226,10 @@ static void atmega_realize(DeviceState *dev, Error **errp)
     SysBusDevice *sbd;
     char *devname;
     size_t i;
+    const size_t usart_count = (mc->usart_count > 0 && mc->usart_count <= USART_MAX)
+        ? mc->usart_count : USART_MAX;
+    const size_t gpio_count = (mc->gpio_count > 0 && mc->gpio_count <= GPIO_MAX)
+        ? mc->gpio_count : GPIO_MAX;
 
     if (!s->xtal_freq_hz) {
         error_setg(errp, "\"xtal-frequency-hz\" property must be provided.");
@@ -306,7 +311,7 @@ static void atmega_realize(DeviceState *dev, Error **errp)
     }
 
     /* GPIO */
-    for (i = 0; i < GPIO_MAX; i++) {
+    for (i = 0; i < gpio_count; i++) {
         int idx = GPIO(i);
         if (!mc->dev[idx].addr) {
             continue;
@@ -318,7 +323,7 @@ static void atmega_realize(DeviceState *dev, Error **errp)
     }
 
     /* USART */
-    for (i = 0; i < USART_MAX; i++) {
+    for (i = 0; i < usart_count; i++) {
         int idx = USART(i);
         if (!mc->dev[idx].addr) {
             continue;
@@ -407,6 +412,7 @@ static void atmega168_class_init(ObjectClass *oc, const void *data)
     amc->io_size = 256;
     amc->gpio_count = 23;
     amc->adc_count = 6;
+    amc->usart_count = 4;
     amc->irq = irq168_328;
     amc->dev = dev168_328;
 };
@@ -422,6 +428,7 @@ static void atmega328_class_init(ObjectClass *oc, const void *data)
     amc->io_size = 256;
     amc->gpio_count = 23;
     amc->adc_count = 6;
+    amc->usart_count = 4;
     amc->irq = irq168_328;
     amc->dev = dev168_328;
 };
@@ -437,6 +444,23 @@ static void atmega1280_class_init(ObjectClass *oc, const void *data)
     amc->io_size = 512;
     amc->gpio_count = 86;
     amc->adc_count = 16;
+    amc->usart_count = 4;
+    amc->irq = irq1280_2560;
+    amc->dev = dev1280_2560;
+};
+
+static void atmega1281_class_init(ObjectClass *oc, void *data)
+{
+    AtmegaMcuClass *amc = ATMEGA_MCU_CLASS(oc);
+
+    amc->cpu_type = AVR_CPU_TYPE_NAME("avr51");
+    amc->flash_size = 128 * KiB;
+    amc->eeprom_size = 4 * KiB;
+    amc->sram_size = 8 * KiB;
+    amc->io_size = 512;
+    amc->gpio_count = 54;
+    amc->adc_count = 8;
+    amc->usart_count = 2;
     amc->irq = irq1280_2560;
     amc->dev = dev1280_2560;
 };
@@ -450,8 +474,25 @@ static void atmega2560_class_init(ObjectClass *oc, const void *data)
     amc->eeprom_size = 4 * KiB;
     amc->sram_size = 8 * KiB;
     amc->io_size = 512;
-    amc->gpio_count = 54;
+    amc->gpio_count = 86;
     amc->adc_count = 16;
+    amc->usart_count = 4;
+    amc->irq = irq1280_2560;
+    amc->dev = dev1280_2560;
+};
+
+static void atmega2561_class_init(ObjectClass *oc, void *data)
+{
+    AtmegaMcuClass *amc = ATMEGA_MCU_CLASS(oc);
+
+    amc->cpu_type = AVR_CPU_TYPE_NAME("avr6");
+    amc->flash_size = 256 * KiB;
+    amc->eeprom_size = 4 * KiB;
+    amc->sram_size = 8 * KiB;
+    amc->io_size = 512;
+    amc->gpio_count = 54;
+    amc->adc_count = 8;
+    amc->usart_count = 2;
     amc->irq = irq1280_2560;
     amc->dev = dev1280_2560;
 };
@@ -466,13 +507,25 @@ static const TypeInfo atmega_mcu_types[] = {
         .parent         = TYPE_ATMEGA_MCU,
         .class_init     = atmega328_class_init,
     }, {
+        .name           = TYPE_ATMEGA640_MCU,
+        .parent         = TYPE_ATMEGA_MCU,
+        .class_init     = atmega640_class_init,
+    }, {
         .name           = TYPE_ATMEGA1280_MCU,
         .parent         = TYPE_ATMEGA_MCU,
         .class_init     = atmega1280_class_init,
     }, {
+        .name           = TYPE_ATMEGA1281_MCU,
+        .parent         = TYPE_ATMEGA_MCU,
+        .class_init     = atmega1281_class_init,
+    }, {
         .name           = TYPE_ATMEGA2560_MCU,
         .parent         = TYPE_ATMEGA_MCU,
         .class_init     = atmega2560_class_init,
+    }, {
+        .name           = TYPE_ATMEGA2561_MCU,
+        .parent         = TYPE_ATMEGA_MCU,
+        .class_init     = atmega2561_class_init,
     }, {
         .name           = TYPE_ATMEGA_MCU,
         .parent         = TYPE_SYS_BUS_DEVICE,
