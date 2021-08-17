@@ -20,17 +20,21 @@
 #define TYPE_ATMEGA_MCU     "ATmega"
 #define TYPE_ATMEGA168_MCU  "ATmega168"
 #define TYPE_ATMEGA328_MCU  "ATmega328"
+#define TYPE_ATMEGA640_MCU  "ATmega640"
 #define TYPE_ATMEGA1280_MCU "ATmega1280"
+#define TYPE_ATMEGA1281_MCU "ATmega1281"
 #define TYPE_ATMEGA2560_MCU "ATmega2560"
+#define TYPE_ATMEGA2561_MCU "ATmega2561"
 
 typedef struct AtmegaMcuState AtmegaMcuState;
 DECLARE_INSTANCE_CHECKER(AtmegaMcuState, ATMEGA_MCU,
                          TYPE_ATMEGA_MCU)
 
 #define POWER_MAX 2
+// ATMEGA1281/2561 have only 2
 #define USART_MAX 4
 #define TIMER_MAX 6
-#define GPIO_MAX 12
+#define GPIO_MAX 86
 
 struct AtmegaMcuState {
     /*< private >*/

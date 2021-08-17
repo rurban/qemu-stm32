@@ -129,6 +129,48 @@ static void arduino_mega2560_class_init(ObjectClass *oc, void *data)
     amc->xtal_hz    = 16 * 1000 * 1000; /* CSTCE16M0V53-R0 */
 };
 
+static void mc640_class_init(ObjectClass *oc, void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    ArduinoMachineClass *amc = ARDUINO_MACHINE_CLASS(oc);
+
+    /*
+     * https://www.microchip.com/en-us/product/ATmega640
+     */
+    mc->desc        = "ATmega640";
+    //mc->alias       = "atmega640";
+    amc->mcu_type   = TYPE_ATMEGA640_MCU;
+    amc->xtal_hz    = 16 * 1000 * 1000;
+};
+
+static void mc1281_class_init(ObjectClass *oc, void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    ArduinoMachineClass *amc = ARDUINO_MACHINE_CLASS(oc);
+
+    /*
+     * https://www.microchip.com/en-us/product/ATmega1281
+     */
+    mc->desc        = "ATmega1281";
+    //mc->alias       = "atmega1281";
+    amc->mcu_type   = TYPE_ATMEGA1281_MCU;
+    amc->xtal_hz    = 16 * 1000 * 1000;
+};
+
+static void mc2561_class_init(ObjectClass *oc, void *data)
+{
+    MachineClass *mc = MACHINE_CLASS(oc);
+    ArduinoMachineClass *amc = ARDUINO_MACHINE_CLASS(oc);
+
+    /*
+     * https://www.microchip.com/en-us/product/ATmega2561
+     */
+    mc->desc        = "ATmega2561";
+    //mc->alias       = "atmega2561";
+    amc->mcu_type   = TYPE_ATMEGA2561_MCU;
+    amc->xtal_hz    = 16 * 1000 * 1000;
+};
+
 static const TypeInfo arduino_machine_types[] = {
     {
         .name          = MACHINE_TYPE_NAME("arduino-duemilanove"),
@@ -146,6 +188,18 @@ static const TypeInfo arduino_machine_types[] = {
         .name          = MACHINE_TYPE_NAME("arduino-mega-2560-v3"),
         .parent        = TYPE_ARDUINO_MACHINE,
         .class_init    = arduino_mega2560_class_init,
+    }, {
+        .name          = MACHINE_TYPE_NAME("atmega640"),
+        .parent        = TYPE_ARDUINO_MACHINE,
+        .class_init    = mc640_class_init,
+    }, {
+        .name          = MACHINE_TYPE_NAME("atmega1281"),
+        .parent        = TYPE_ARDUINO_MACHINE,
+        .class_init    = mc1281_class_init,
+    }, {
+        .name          = MACHINE_TYPE_NAME("atmega2561"),
+        .parent        = TYPE_ARDUINO_MACHINE,
+        .class_init    = mc2561_class_init,
     }, {
         .name           = TYPE_ARDUINO_MACHINE,
         .parent         = TYPE_MACHINE,
