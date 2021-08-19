@@ -154,6 +154,11 @@ config OLIMEX_STM32_H405
     depends on TCG && ARM
     select STM32F405_SOC
 
+config QUECTELBC66
+    bool
+    default y if TCG && ARM
+    select MTK2656_SOC
+
 config NSERIES
     bool
     default y
@@ -474,6 +479,13 @@ config STM32L4X5_SOC
     select OR_IRQ
     select STM32L4X5_SYSCFG
     select STM32L4X5_EXTI
+
+config MTK2656_SOC
+    bool
+    select ARM_V7M
+    select OR_IRQ
+    select STM32F4XX_SYSCFG
+    select STM32F4XX_EXTI
 
 config XLNX_ZYNQMP_ARM
     bool
